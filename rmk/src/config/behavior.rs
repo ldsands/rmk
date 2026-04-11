@@ -18,6 +18,7 @@ pub struct BehaviorConfig {
     pub morse: MorsesConfig,
     pub keyboard_macros: KeyboardMacrosConfig,
     pub mouse_key: MouseKeyConfig,
+    pub sticky_mod: StickyModConfig,
 }
 
 /// Configurations for tap behavior
@@ -77,6 +78,23 @@ impl Default for OneShotConfig {
 pub struct OneShotModifiersConfig {
     /// Should modifiers be active from keypress (sticky modifiers)
     pub activate_on_keypress: bool,
+}
+
+/// Configuration for StickyMod behavior
+#[derive(Clone, Copy, Debug)]
+pub struct StickyModConfig {
+    /// Timeout before automatically releasing the held modifier.
+    /// Duration::MAX means no timeout — modifier is held until
+    /// another key press or layer change.
+    pub timeout: Duration,
+}
+
+impl Default for StickyModConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::MAX,
+        }
+    }
 }
 
 /// Config for combo behavior
