@@ -90,12 +90,6 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
         let mut layer_sub = crate::event::LayerChangeEvent::subscriber();
         #[cfg(feature = "_ble")]
         let mut clear_peer_sub = crate::event::ClearPeerEvent::subscriber();
-        #[cfg(feature = "display")]
-        let mut wpm_sub = crate::event::WpmUpdateEvent::subscriber();
-        #[cfg(feature = "display")]
-        let mut modifier_sub = crate::event::ModifierEvent::subscriber();
-        #[cfg(feature = "display")]
-        let mut sleep_sub = crate::event::SleepStateEvent::subscriber();
 
         loop {
             let elapsed = last_sync_time.elapsed().as_millis();
@@ -120,9 +114,6 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                         }
                         SplitMessage::ClearPeer
                     },
-                    with_feature("display"): e = wpm_sub.next_event().fuse() => SplitMessage::Wpm(e.0),
-                    with_feature("display"): e = modifier_sub.next_event().fuse() => SplitMessage::Modifier(e.modifier.into_bits()),
-                    with_feature("display"): e = sleep_sub.next_event().fuse() => SplitMessage::SleepState(e.0),
                 }
             };
 
