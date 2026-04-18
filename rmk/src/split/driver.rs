@@ -8,7 +8,7 @@ use futures::FutureExt;
 
 use super::SplitMessage;
 use crate::CONNECTION_STATE;
-use crate::event::{KeyboardEvent, KeyboardEventPos, SubscribableEvent, publish_event, publish_event_async};
+use crate::event::{KeyboardEvent, KeyboardEventPos, SubscribableEvent, publish_event};
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -168,7 +168,7 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                             key_pos.col + COL_OFFSET as u8,
                             e.pressed,
                         );
-                        publish_event_async(adjusted_key_event).await;
+                        publish_event(adjusted_key_event);
                     } else {
                         warn!("Key event from peripheral is ignored because the connection is not established.");
                     }
@@ -177,7 +177,7 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                     // For rotary encoder
                     if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
                         // Only when the connection is established, send the key event.
-                        publish_event_async(e).await;
+                        publish_event(e);
                     }
                 }
             },
