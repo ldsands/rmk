@@ -64,6 +64,26 @@ OSSM example:
 activate_on_keypress = true
 ```
 
+## Sticky Modifiers
+
+The `sticky_mod` sub-table configures the StickyMod (`SM`) feature.
+
+`SM(key, modifier)` holds a modifier across repeated presses of the same key. This is useful for Alt+Tab-style window/tab cycling: the first press sends `modifier + key` (e.g. Alt+Tab), then on each subsequent press the modifier stays held so only `key` is sent again. The modifier releases automatically when:
+- Any non-SM, non-modifier key is pressed
+- The active layer changes
+
+This differs from `OSM` (one-shot modifier), which sends the modifier only once and always releases after the next keypress.
+
+Default behavior: no timeout — modifier held until released by a key press or layer change.
+
+Optional timeout example:
+```toml
+[behavior.sticky_mod]
+timeout = "5s"  # auto-release the modifier after 5 seconds of inactivity
+```
+
+To use StickyMod in your keymap, see `SM(key, modifier)` in the [keymap configuration](./layout#keymap-config).
+
 ## Combo
 
 In the `combo` sub-table, you can configure the keyboard's combo key functionality. Combo allows you to define a group of keys that, when pressed simultaneously, will trigger a specific output action.
