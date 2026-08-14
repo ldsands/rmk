@@ -1,250 +1,201 @@
-use core::cell::RefCell;
-
 use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeSetPhy, LeSetScanParams};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use embassy_futures::select::{Either, Either3, select, select3};
-use embassy_sync::mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, with_timeout};
-use heapless::VecView;
 use trouble_host::prelude::*;
 
 use super::GattSplitMessage;
+use crate::ble::adv::Adv;
+use crate::ble::scan::{SPLIT_CENTRAL_SCAN_WINDOW, scan_config, start_scan};
 use crate::ble::sleep::report_activity;
-use crate::ble::{update_ble_phy, update_conn_params};
+use crate::ble::{update_ble_phy, update_conn_params, wait_for_stack_started};
 use crate::channel::FLASH_CHANNEL;
 use crate::event::{EventSubscriber, SleepStateEvent, SubscribableEvent};
-#[cfg(feature = "storage")]
 use crate::split::ble::PeerAddress;
 use crate::split::driver::{PeripheralManager, SplitDriverError, SplitReader, SplitWriter, set_peripheral_connected};
-use crate::split::{SPLIT_MESSAGE_MAX_SIZE, SplitMessage};
+use crate::split::{PeripheralMatrixConfig, SPLIT_MESSAGE_MAX_SIZE, SplitMessage};
 use crate::storage::FlashOperationMessage;
 
-pub(crate) static STACK_STARTED: Signal<crate::RawMutex, bool> = Signal::new();
-pub(crate) static PERIPHERAL_FOUND: Signal<crate::RawMutex, (u8, BdAddr)> = Signal::new();
+static PERIPHERAL_FOUND: Signal<crate::RawMutex, (u8, BdAddr)> = Signal::new();
 
-// Signals and mutex for syncing scanning state between scanning task and peripheral manager
-static START_SCANNING: Signal<crate::RawMutex, ()> = Signal::new();
-static STOP_SCANNING: Signal<crate::RawMutex, ()> = Signal::new();
-static SCANNING_MUTEX: Mutex<crate::RawMutex, ()> = Mutex::new(());
-
-/// Gatt service used in split central to send split message to peripheral
-#[gatt_service(uuid = "4dd5fbaa-18e5-4b07-bf0a-353698659946")]
-struct SplitBleCentralService {
-    #[characteristic(uuid = "0e6313e3-bd0b-45c2-8d2e-37a2e8128bc3", read, notify)]
-    message_to_central: [u8; SPLIT_MESSAGE_MAX_SIZE],
-
-    #[characteristic(uuid = "4b3514fb-cae4-4d38-a097-3a2a3d1c3b9c", write_without_response, read, notify)]
-    message_to_peripheral: [u8; SPLIT_MESSAGE_MAX_SIZE],
+/// One peripheral link's lifecycle, owned by [`scan_and_connect_peripherals`].
+enum SlotState {
+    /// Unknown address: discover the peripheral by scanning.
+    NoAddr,
+    /// Known address without a live session: connect the peripheral.
+    Disconnected([u8; 6]),
+    /// The link is up and handed to the slot's session task.
+    Connected([u8; 6]),
 }
 
-/// Gatt server in split peripheral
-#[gatt_server]
-struct BleSplitCentralServer {
-    service: SplitBleCentralService,
-}
+// The split service and its two characteristics, declared by `#[gatt_service]`
+// in `split::ble::peripheral` and discovered by UUID here.
+const SPLIT_SERVICE_UUID: u128 = 0x4dd5fbaa_18e5_4b07_bf0a_353698659946;
+const MESSAGE_TO_CENTRAL_UUID: u128 = 0x0e6313e3_bd0b_45c2_8d2e_37a2e8128bc3;
+const MESSAGE_TO_PERIPHERAL_UUID: u128 = 0x4b3514fb_cae4_4d38_a097_3a2a3d1c3b9c;
 
-pub async fn scan_peripherals<
-    'b,
-    's: 'b,
-    C: Controller
-        + ControllerCmdSync<LeSetScanParams>
-        + ControllerCmdAsync<LeSetPhy>
-        + ControllerCmdSync<LeReadLocalSupportedFeatures>,
->(
-    stack: &'b Stack<'s, C, DefaultPacketPool>,
-    addrs: &RefCell<VecView<Option<[u8; 6]>>>,
+/// Scan for peripheral addresses, connect them, and hand each connection to
+/// that slot's session; sessions report back on `ended`.
+pub(crate) async fn scan_and_connect_peripherals<'a, C: Controller + ControllerCmdSync<LeSetScanParams>>(
+    stack: &'a Stack<'_, C, DefaultPacketPool>,
+    conns: &[Channel<NoopRawMutex, Connection<'a, DefaultPacketPool>, 1>; crate::SPLIT_PERIPHERALS_NUM],
+    ended: &Channel<NoopRawMutex, usize, { crate::SPLIT_PERIPHERALS_NUM }>,
 ) {
+    // Load each peripheral's stored address first.
+    let mut peripheral_slots: [SlotState; crate::SPLIT_PERIPHERALS_NUM] = core::array::from_fn(|_| SlotState::NoAddr);
+    for (id, slot) in peripheral_slots.iter_mut().enumerate() {
+        if let Some(peer) = crate::storage::read_peer_address(id as u8)
+            .await
+            .filter(|peer| peer.is_valid)
+        {
+            *slot = SlotState::Disconnected(peer.address);
+        }
+    }
+
+    let mut central = stack.central();
+    wait_for_stack_started().await;
     loop {
-        // Wait unitil `START_SCANNING` is signaled
-        START_SCANNING.wait().await;
-        // Check whether the scanning is needed, aka there's empty slot in the addr list.
-        let need_scan = !addrs.borrow().iter().all(|a| a.is_some());
-        if need_scan {
-            let scanning_fut = async {
-                loop {
-                    let mut central = stack.central();
-                    wait_for_stack_started().await;
-                    let mut scanner = Scanner::new(&mut central);
-                    let scan_config = ScanConfig {
-                        active: false,
-                        interval: Duration::from_millis(100),
-                        window: Duration::from_millis(30),
-                        ..Default::default()
-                    };
-                    let _guard = SCANNING_MUTEX.lock().await;
-                    if let Ok(_session) = scanner.scan(&scan_config).await {
-                        info!("Start scanning peripherals");
-                        STOP_SCANNING.wait().await;
-                        info!("Stop scanning");
+        // The radio is the biggest draw while the keyboard sleeps, and a peripheral
+        // that isn't connected can't wake it anyway. Established links stay up.
+        while crate::state::current_sleep_state() {
+            Timer::after_secs(1).await;
+        }
+
+        // Mark ended sessions `Disconnected`.
+        while let Ok(id) = ended.try_receive() {
+            if let SlotState::Connected(addr) = peripheral_slots[id] {
+                peripheral_slots[id] = SlotState::Disconnected(addr);
+            }
+        }
+
+        // Put every pending address in one accept list: the controller connects
+        // to whichever peripheral answers first, so an absent one doesn't block
+        // a present one for the whole timeout window.
+        let mut pending: heapless::Vec<(usize, [u8; 6]), { crate::SPLIT_PERIPHERALS_NUM }> = heapless::Vec::new();
+        for (id, slot) in peripheral_slots.iter().enumerate() {
+            if let SlotState::Disconnected(addr) = slot {
+                let _ = pending.push((id, *addr));
+            }
+        }
+        if !pending.is_empty() {
+            // If there're `Disconnected` peripherals, connect to them first.
+            let targets: heapless::Vec<Address, { crate::SPLIT_PERIPHERALS_NUM }> =
+                pending.iter().map(|(_, addr)| Address::random(*addr)).collect();
+            let config = ConnectConfig {
+                connect_params: default_central_conn_param(),
+                scan_config: ScanConfig {
+                    filter_accept_list: &targets,
+                    ..scan_config(SPLIT_CENTRAL_SCAN_WINDOW)
+                },
+            };
+            info!("Start connecting, {} peripheral(s) pending", pending.len());
+            match with_timeout(Duration::from_secs(15), central.connect(&config)).await {
+                Ok(Ok(conn)) => {
+                    let peer = conn.peer_address();
+                    if let Some(&(id, addr)) = pending.iter().find(|(_, addr)| Address::random(*addr) == peer) {
+                        info!("Connected to peripheral {}", id);
+                        peripheral_slots[id] = SlotState::Connected(addr);
+                        conns[id].send(conn).await;
+                    } else {
+                        warn!("Connected peer {:?} matches no pending slot", peer.addr);
                     }
                 }
-            };
-            let update_addrs_fut = async {
-                loop {
-                    let (found_peripheral_id, addr) = PERIPHERAL_FOUND.wait().await;
-                    let scanned_addr = addr.into_inner();
-                    if let Some(Some(stored_addr)) = addrs.borrow_mut().get_mut(found_peripheral_id as usize)
-                        && *stored_addr == scanned_addr
-                    {
-                        continue;
+                Ok(Err(e)) => {
+                    #[cfg(feature = "defmt")]
+                    let e = defmt::Debug2Format(&e);
+                    error!("Connect error: {:?}", e);
+                    Timer::after_millis(500).await;
+                }
+                Err(_) => {
+                    // None answered: forget the addresses and rediscover the
+                    // peripherals when they come back.
+                    warn!("Connect timeout, clearing {} address(es)", pending.len());
+                    for &(id, _) in &pending {
+                        peripheral_slots[id] = SlotState::NoAddr;
                     }
-
-                    info!("Scanned new peripheral {:?}", scanned_addr);
-                    let mut slot_updated = false;
-                    if let Some(slot) = addrs.borrow_mut().get_mut(found_peripheral_id as usize)
-                        && slot.is_none()
-                    {
-                        // Update only when the slot is empty
-                        *slot = Some(scanned_addr);
-                        slot_updated = true;
-                    }
-
-                    // Update stored addr.
-                    // This cannot be put inside the `addrs.borrow_mut()` block because the sending is async
-                    if slot_updated {
+                }
+            }
+        } else if peripheral_slots.iter().any(|s| matches!(s, SlotState::NoAddr)) {
+            // No `Disconnected` peripherals, check `NoAddr` peripheral slot and scan new peripherals
+            info!("Start scanning peripherals");
+            let session = start_scan(stack, SPLIT_CENTRAL_SCAN_WINDOW).await;
+            let event = select(PERIPHERAL_FOUND.wait(), ended.ready_to_receive()).await;
+            // Wait until the controller has confirmed the stop: it refuses an
+            // initiator until then.
+            session.stop().await;
+            info!("Stop scanning");
+            if let Either::First((id, addr)) = event {
+                // The id comes off the air — bounds-check it. Keep the first
+                // address seen for a slot; an occupied slot is cleared only
+                // when connecting to it times out.
+                match peripheral_slots.get_mut(id as usize) {
+                    Some(slot) if matches!(slot, SlotState::NoAddr) => {
+                        let addr = addr.into_inner();
+                        info!("Scanned new peripheral {:?}", addr);
+                        *slot = SlotState::Disconnected(addr);
                         FLASH_CHANNEL
-                            .send(FlashOperationMessage::PeerAddress(PeerAddress::new(
-                                found_peripheral_id,
-                                true,
-                                scanned_addr,
-                            )))
+                            .send(FlashOperationMessage::PeerAddress(PeerAddress::new(id, true, addr)))
                             .await;
                     }
-
-                    if addrs.borrow().iter().all(|a| a.is_some()) {
-                        break;
-                    }
+                    _ => {}
                 }
-            };
-
-            // Scan until all peripherals are scanned
-            // TODO: Timeout?
-            select(scanning_fut, update_addrs_fut).await;
+            }
+        } else {
+            // Fully linked: park until a session ends.
+            ended.ready_to_receive().await;
         }
     }
 }
 
 // When no peripheral address is saved, the central should first scan for peripheral.
 // This handler is used to handle the scan result.
-pub(crate) struct ScanHandler {}
+pub(crate) struct ScanHandler;
 
 impl EventHandler for ScanHandler {
     fn on_adv_reports(&self, mut it: LeAdvReportsIter<'_>) {
         while let Some(Ok(report)) = it.next() {
-            // Check advertisement data
-            if report.data.len() < 25 {
+            let Some(Adv::SplitPeripheral { id }) = Adv::decode(report.data) else {
                 continue;
-            }
-            if report.data[4] == 0x07
-                && report.data[5..].starts_with(&[
-                    // uuid: 4dd5fbaa-18e5-4b07-bf0a-353698659946
-                    70u8, 153u8, 101u8, 152u8, 54u8, 53u8, 10u8, 191u8, 7u8, 75u8, 229u8, 24u8, 170u8, 251u8, 213u8,
-                    77u8,
-                ])
-                && report.data[21..25] == [0x04, 0xff, 0x18, 0xe1]
-            {
-                // Uuid and manufacturer specific data check passed
-                let peripheral_id = report.data[25];
-                info!("Found split peripheral: id={:?}, addr={:?}", peripheral_id, report.addr);
-                PERIPHERAL_FOUND.signal((peripheral_id, report.addr));
-                break;
-            }
+            };
+            info!("Found split peripheral: id={:?}, addr={:?}", id, report.addr);
+            PERIPHERAL_FOUND.signal((id, report.addr));
+            break;
         }
     }
 }
 
-pub(crate) async fn run_ble_peripheral_manager<
-    'b,
-    's: 'b,
-    C: Controller
-        + ControllerCmdSync<LeSetScanParams>
-        + ControllerCmdAsync<LeSetPhy>
-        + ControllerCmdSync<LeReadLocalSupportedFeatures>,
-    const ROW: usize,
-    const COL: usize,
-    const ROW_OFFSET: usize,
-    const COL_OFFSET: usize,
+/// Serve one peripheral slot: take each link established by
+/// [`scan_and_connect_peripherals`], run the split session over it until it ends, and
+/// report back so the radio reconnects or rediscovers the peripheral.
+pub(crate) async fn run_peripheral_session<
+    'a,
+    C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
 >(
-    peri_id: usize,
-    addrs: &RefCell<VecView<Option<[u8; 6]>>>,
-    stack: &'b Stack<'s, C, DefaultPacketPool>,
+    id: usize,
+    conns: &Channel<NoopRawMutex, Connection<'a, DefaultPacketPool>, 1>,
+    ended: &Channel<NoopRawMutex, usize, { crate::SPLIT_PERIPHERALS_NUM }>,
+    stack: &'a Stack<'_, C, DefaultPacketPool>,
+    matrix_config: PeripheralMatrixConfig,
 ) {
     trace!("SPLIT_MESSAGE_MAX_SIZE: {}", SPLIT_MESSAGE_MAX_SIZE);
-
     loop {
-        // Check until the address is available
-        let address = loop {
-            if let Some(Some(addr)) = addrs.borrow().get(peri_id) {
-                break Address::random(*addr);
-            }
-            if !START_SCANNING.signaled() {
-                START_SCANNING.signal(());
-            }
-            // Check again after 500ms
-            embassy_time::Timer::after_millis(500).await;
-        };
-        info!("Peripheral peer address: {:?}", address);
-
-        let mut central = stack.central();
-        let config = ConnectConfig {
-            connect_params: default_central_conn_param(),
-            scan_config: ScanConfig {
-                filter_accept_list: &[address],
-                active: false,
-                interval: Duration::from_millis(100),
-                window: Duration::from_millis(30),
-                ..Default::default()
-            },
-        };
-        wait_for_stack_started().await;
-
-        set_peripheral_connected(peri_id, false);
-
-        // Connect to peripheral
-        match with_timeout(Duration::from_secs(15), async {
-            if let Ok(_guard) = SCANNING_MUTEX.try_lock() {
-                info!("Start connecting to peripheral {}", peri_id);
-                central.connect(&config).await
-            } else {
-                STOP_SCANNING.signal(());
-                let _guard = SCANNING_MUTEX.lock().await;
-                // Wait a little bit to ensure that the scanning has been fully stopped
-                embassy_time::Timer::after_millis(100).await;
-                info!("Start connecting to peripheral {}", peri_id);
-                central.connect(&config).await
-            }
-        })
-        .await
-        {
-            Ok(Ok(conn)) => {
-                info!("Connected to peripheral {}", peri_id);
-
-                set_peripheral_connected(peri_id, true);
-
-                if let Err(e) =
-                    run_central_manager_task::<_, _, ROW, COL, ROW_OFFSET, COL_OFFSET>(peri_id, stack, &conn).await
-                {
-                    #[cfg(feature = "defmt")]
-                    let e = defmt::Debug2Format(&e);
-                    error!("BLE central error: {:?}", e);
-                }
-            }
-            Ok(Err(e)) => {
-                #[cfg(feature = "defmt")]
-                let e = defmt::Debug2Format(&e);
-                error!("Connect to peripheral {} error: {:?}", peri_id, e);
-            }
-            Err(_) => {
-                // Connect to peripheral timeout
-                warn!("Connect to peripheral {} timeout, clearing", peri_id);
-                if let Some(addr) = addrs.borrow_mut().get_mut(peri_id) {
-                    *addr = None
-                };
-            }
+        let conn = conns.receive().await;
+        set_peripheral_connected(id, true);
+        if let Err(e) = run_central_manager_task(id, stack, &conn, matrix_config).await {
+            #[cfg(feature = "defmt")]
+            let e = defmt::Debug2Format(&e);
+            error!("BLE central error: {:?}", e);
         }
-        // Reconnect after 500ms
-        embassy_time::Timer::after_millis(500).await;
+        set_peripheral_connected(id, false);
+        // Dropping the last handle files a disconnect request that the stack
+        // runner serves on its own; the pause lets that finish and lets the
+        // peripheral advertise again, so the reconnect finds a clean state.
+        drop(conn);
+        Timer::after_millis(500).await;
+        ended.send(id).await;
     }
 }
 
@@ -253,7 +204,7 @@ fn default_central_conn_param() -> RequestedConnParams {
         min_connection_interval: Duration::from_micros(7500),
         max_connection_interval: Duration::from_micros(7500),
         max_latency: 10, // 75ms
-        supervision_timeout: Duration::from_secs(10),
+        supervision_timeout: Duration::from_secs(5),
         ..Default::default()
     }
 }
@@ -289,14 +240,11 @@ async fn run_central_manager_task<
     's: 'b,
     C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
     P: PacketPool,
-    const ROW: usize,
-    const COL: usize,
-    const ROW_OFFSET: usize,
-    const COL_OFFSET: usize,
 >(
     id: usize,
     stack: &'b Stack<'s, C, P>,
     conn: &Connection<'b, P>,
+    matrix_config: PeripheralMatrixConfig,
 ) -> Result<(), BleHostError<C::Error>> {
     let client = GattClient::<C, P, 10>::new(stack, conn).await?;
 
@@ -306,116 +254,75 @@ async fn run_central_manager_task<
     info!("Updating connection parameters for peripheral");
     update_conn_params(stack, conn, &default_central_conn_param()).await;
 
-    match select3(
+    let (Either3::First(e) | Either3::Second(e) | Either3::Third(e)) = select3(
         ble_central_task(&client, conn),
-        run_peripheral_manager::<_, _, ROW, COL, ROW_OFFSET, COL_OFFSET>(id, &client),
+        discover_and_run_manager(id, &client, matrix_config),
         follow_sleep_state(stack, conn),
     )
-    .await
-    {
-        Either3::First(e) => e,
-        Either3::Second(e) => e,
-        Either3::Third(e) => e,
-    }
+    .await;
+    e
 }
 
 async fn ble_central_task<'a, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool>(
     client: &GattClient<'a, C, P, 10>,
     conn: &Connection<'a, P>,
 ) -> Result<(), BleHostError<C::Error>> {
-    // Simply monitor connection status
-    let conn_check = async {
-        while conn.is_connected() {
-            Timer::after_secs(5).await;
+    // Watch for the disconnect; draining the other events keeps the small
+    // per-connection queue from sitting full and dropping it.
+    let conn_events = async {
+        loop {
+            if let ConnectionEvent::Disconnected { reason } = conn.next().await {
+                info!("Connection lost: {:?}", reason);
+                break;
+            }
         }
     };
 
-    match select(client.task(), conn_check).await {
+    match select(client.task(), conn_events).await {
         Either::First(e) => e,
-        Either::Second(_) => {
-            info!("Connection lost");
-            Ok(())
-        }
+        Either::Second(()) => Ok(()),
     }
 }
 
-async fn run_peripheral_manager<
-    'a,
-    C: Controller + ControllerCmdAsync<LeSetPhy>,
-    P: PacketPool,
-    const ROW: usize,
-    const COL: usize,
-    const ROW_OFFSET: usize,
-    const COL_OFFSET: usize,
->(
+/// Discover the split service on the connected peripheral, then run its
+/// [`PeripheralManager`] over the GATT link.
+async fn discover_and_run_manager<C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool>(
     id: usize,
-    client: &GattClient<'a, C, P, 10>,
+    client: &GattClient<'_, C, P, 10>,
+    matrix_config: PeripheralMatrixConfig,
 ) -> Result<(), BleHostError<C::Error>> {
     let services = client
-        .services_by_uuid(&Uuid::new_long([
-            70u8, 153u8, 101u8, 152u8, 54u8, 53u8, 10u8, 191u8, 7u8, 75u8, 229u8, 24u8, 170u8, 251u8, 213u8, 77u8,
-        ]))
+        .services_by_uuid(&Uuid::new_long(SPLIT_SERVICE_UUID.to_le_bytes()))
         .await?;
     info!("Services found");
-    if let Some(service) = services.first() {
-        let message_to_central = client
-            .characteristic_by_uuid::<GattSplitMessage>(
-                service,
-                // uuid: 0e6313e3-bd0b-45c2-8d2e-37a2e8128bc3
-                &Uuid::Uuid128([
-                    195u8, 139u8, 18u8, 232u8, 162u8, 55u8, 46u8, 141u8, 194u8, 69u8, 11u8, 189u8, 227u8, 19u8, 99u8,
-                    14u8,
-                ]),
-            )
-            .await?;
-        info!("Message to central found");
-        let message_to_peripheral = client
-            .characteristic_by_uuid::<GattSplitMessage>(
-                service,
-                // uuid: 4b3514fb-cae4-4d38-a097-3a2a3d1c3b9c
-                &Uuid::Uuid128([
-                    156u8, 59u8, 28u8, 61u8, 42u8, 58u8, 151u8, 160u8, 56u8, 77u8, 228u8, 202u8, 251u8, 20u8, 53u8,
-                    75u8,
-                ]),
-            )
-            .await?;
-        info!("Subscribing notifications");
-        let listener = client.subscribe(&message_to_central, false).await?;
-        let split_ble_driver = BleSplitCentralDriver::new(listener, message_to_peripheral, client);
-        let peripheral_manager = PeripheralManager::<ROW, COL, ROW_OFFSET, COL_OFFSET, _>::new(split_ble_driver, id);
-        peripheral_manager.run().await;
-        info!("Peripheral manager stopped");
+    let Some(service) = services.first() else {
+        return Ok(());
     };
+    let message_to_central = client
+        .characteristic_by_uuid::<GattSplitMessage>(service, &Uuid::new_long(MESSAGE_TO_CENTRAL_UUID.to_le_bytes()))
+        .await?;
+    info!("Message to central found");
+    let message_to_peripheral = client
+        .characteristic_by_uuid::<GattSplitMessage>(service, &Uuid::new_long(MESSAGE_TO_PERIPHERAL_UUID.to_le_bytes()))
+        .await?;
+    info!("Subscribing notifications");
+    let listener = client.subscribe(&message_to_central, false).await?;
+    let split_ble_driver = BleSplitCentralDriver {
+        listener,
+        message_to_peripheral,
+        client,
+    };
+    PeripheralManager::new(split_ble_driver, id, matrix_config).run().await;
+    info!("Peripheral manager stopped");
     Ok(())
 }
 
-/// Ble central driver which reads and writes the split message.
-///
-/// Different from serial, BLE split message is processed in a separate service.
-/// The BLE service should keep running, it processes the split message in the callback, which is not async.
-/// It's impossible to implement `SplitReader` or `SplitWriter` for BLE service,
-/// so we need this wrapper to forward split message to channel.
-pub(crate) struct BleSplitCentralDriver<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> {
-    // Listener for split message from peripheral
+/// [`SplitReader`]/[`SplitWriter`] over the peripheral's GATT link: reads are
+/// notifications on `message_to_central`, writes go to `message_to_peripheral`.
+struct BleSplitCentralDriver<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> {
     listener: NotificationListener<'b, 512>,
-    // Characteristic to send split message to peripheral
     message_to_peripheral: Characteristic<GattSplitMessage>,
-    // Client
     client: &'c GattClient<'a, C, P, 10>,
-}
-
-impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> BleSplitCentralDriver<'a, 'b, 'c, C, P> {
-    pub(crate) fn new(
-        listener: NotificationListener<'b, 512>,
-        message_to_peripheral: Characteristic<GattSplitMessage>,
-        client: &'c GattClient<'a, C, P, 10>,
-    ) -> Self {
-        Self {
-            listener,
-            message_to_peripheral,
-            client,
-        }
-    }
 }
 
 impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> SplitReader
@@ -456,19 +363,6 @@ impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> Sp
         }
 
         Ok(gatt_msg.len)
-    }
-}
-
-/// Wait for the BLE stack to start.
-///
-/// If the BLE stack has been started, wait 500ms then quit.
-pub(crate) async fn wait_for_stack_started() {
-    loop {
-        if STACK_STARTED.signaled() {
-            embassy_time::Timer::after_millis(500).await;
-            break;
-        }
-        embassy_time::Timer::after_millis(500).await;
     }
 }
 

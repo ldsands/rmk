@@ -21,7 +21,7 @@ use rmk::processor::builtin::dfu_led::DfuLedProcessor;
 use rmk::run_all;
 use rmk::split::SPLIT_MESSAGE_MAX_SIZE;
 use rmk::split::peripheral::run_rmk_split_peripheral;
-use rmk::storage::{async_flash_wrapper, new_storage_for_split_peripheral};
+use rmk::storage::{async_flash_wrapper, new_storage_without_keymap};
 use rmk::watchdog::Rp2040Watchdog;
 use static_cell::StaticCell;
 
@@ -91,14 +91,14 @@ async fn main(_spawner: Spawner) {
         clear_storage: false,
         clear_layout: false,
     };
-    let mut storage = new_storage_for_split_peripheral(flash, storage_config).await;
+    let mut storage = new_storage_without_keymap(flash, storage_config).await;
 
     let mut watchdog_runner = Rp2040Watchdog::default_runner(embassy_rp::watchdog::Watchdog::new(p.WATCHDOG));
 
     join3(
         run_all!(matrix, storage, dfu_led, watchdog_runner),
         run_rmk_split_peripheral(uart_instance),
-        rmk::dfu::run_peripheral_dfu(dfu_driver, dfu_device_config),
+        rmk::usb::run_peripheral_usb(dfu_driver, dfu_device_config),
     )
     .await;
 }

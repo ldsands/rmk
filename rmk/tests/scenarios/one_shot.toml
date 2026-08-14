@@ -52,6 +52,25 @@ expect = [
   [],
 ]
 
+# Chain mode (`quick_release = false`) keeps the one-shot modifier in the HID
+# report until the first key releases. A second rolled key therefore shares the
+# modifier while both keys are held, then remains down without it.
+[[test]]
+name = "osm_rollover_keeps_modifier_until_first_key_release"
+steps = [
+  { tap = { pos = [0, 0], duration = 10 } },  # OSM(LShift)
+  { press = [0, 2] },  # Press A
+  { press = [1, 3] },  # Press W before A is released (rollover)
+  { release = [0, 2] },
+  { release = [1, 3] },
+]
+expect = [
+  ["LShift", "A"],  # A gets the one-shot modifier
+  ["LShift", "A", "W"],
+  ["W"],
+  [],
+]
+
 # OSM released while the tap-hold key is still down: the tap still carries it.
 [[test]]
 name = "osm_rolling_with_tap_hold"
@@ -190,6 +209,23 @@ steps = [
   { tap = { pos = [0, 2], duration = 10 } },
 ]
 expect = [["LShift", "C"], []]
+
+# OSL first, so (0,0) resolves to layer 1's OSM(LShift | LCtrl). The modifier
+# and layer latches coexist, so the next key still comes from layer 1.
+# A held (not tapped) OSL also coexists with a pending OSM. This characterizes
+# the same independent Sticky modifier/layer behavior as the tapped case above.
+[[test]]
+name = "osm_then_held_osl"
+steps = [
+  { tap = { pos = [0, 0], duration = 10 } },  # OSM(LShift)
+  { press = [0, 1] },  # Press OSL(1), held rather than tapped
+  { tap = { pos = [0, 2], duration = 10 } },  # C from layer 1
+  { release = [0, 1] },  # Release OSL(1)
+]
+expect = [
+  ["LShift", "C"],
+  [],
+]
 
 # OSL first, so (0,0) resolves to layer 1's OSM(LShift | LCtrl). The modifier
 # and layer latches coexist, so the next key still comes from layer 1.
