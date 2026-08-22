@@ -1,5 +1,6 @@
 #[cfg(feature = "_ble")]
-use bt_hci::{cmd::le::LeSetPhy, controller::ControllerCmdAsync};
+#[cfg(all(feature = "_ble", feature = "subrating"))]
+use bt_hci::{cmd::le::LeSetHostFeature, controller::ControllerCmdSync};
 use embassy_futures::select::{Either, select};
 #[cfg(not(feature = "_ble"))]
 use embedded_io_async::{Read, Write};
@@ -35,7 +36,8 @@ use crate::state::update_status;
 /// * `address` - (optional) The BLE address of this peripheral
 /// * `serial` - (optional) serial port used to send peripheral split message. This argument is enabled only for serial split now
 pub async fn run_rmk_split_peripheral<
-    #[cfg(feature = "_ble")] C: Controller + ControllerCmdAsync<LeSetPhy>,
+    #[cfg(all(feature = "_ble", feature = "subrating"))] C: Controller + ControllerCmdSync<LeSetHostFeature>,
+    #[cfg(all(feature = "_ble", not(feature = "subrating")))] C: Controller,
     #[cfg(not(feature = "_ble"))] S: Write + Read,
 >(
     #[cfg(feature = "_ble")] id: usize,
@@ -123,6 +125,14 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                         SplitMessage::ConnectionStatus(status) => {
                             trace!("Received central connection status: {:?}", status);
                             update_status(|c| *c = status);
+                            // The central sends this only after subscribing to split notifications.
+                            #[cfg(feature = "_ble")]
+                            self.split_driver
+                                .write(&SplitMessage::BatteryStatus(
+                                    crate::input_device::battery::current_battery_status().into(),
+                                ))
+                                .await
+                                .ok();
                         }
                         #[cfg(all(feature = "_ble", feature = "storage"))]
                         SplitMessage::ClearPeer => {

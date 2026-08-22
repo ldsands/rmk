@@ -297,6 +297,8 @@ The `layer.keys` string follows several rules:
 
 10. For a configurable Sticky Key, use `SK(modifier)`, `SK(MO(n))`, or `SK(key, [modifiers])`. An optional named profile is written as the final `@profile` argument: `SK(LShift, @quick)` or `SK(Tab, [LAlt], @alt_tab)`. See [Sticky Keys](./behavior#sticky-keys).
 
+11. For a [Plover HID steno](../features/steno) key, use `STN(key)`, where `key` is the steno key name (for example `STN(S1)`). Requires the `steno` Cargo feature.
+
 ## Aliases
 
 The `[aliases]` section maps user-defined names to replacement strings, which you can then use in `layer.keys`:

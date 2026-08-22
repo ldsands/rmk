@@ -1,4 +1,6 @@
 use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeSetPhy};
+#[cfg(feature = "subrating")]
+use bt_hci::cmd::le::{LeSetHostFeature, LeSubrateRequest};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use bt_hci::param::Error as HciError;
 use embassy_futures::join::join3;
@@ -16,6 +18,8 @@ use trouble_host::prelude::*;
 
 use crate::ble::adv::{Adv, advertise};
 use crate::ble::battery_service::BleBatteryServer;
+#[cfg(feature = "split")]
+use crate::ble::battery_service::BlePeripheralBatteryServer;
 use crate::ble::ble_server::{BleHidServer, Server};
 use crate::ble::device_info::{PnPID, VidSource};
 #[cfg(feature = "host")]
@@ -32,6 +36,8 @@ use crate::event::SubscribableEvent;
 use crate::hid::{HidWriterTrait, run_led_reader};
 #[cfg(feature = "split")]
 use crate::split::PeripheralMatrixConfig;
+#[cfg(feature = "subrating")]
+use crate::split::ble::central::subrating;
 #[cfg(feature = "split")]
 use crate::split::ble::central::{run_peripheral_session, scan_and_connect_peripherals};
 use crate::state::set_ble_state;
@@ -50,6 +56,9 @@ pub(crate) mod profile;
 #[cfg(any(feature = "split", feature = "dongle"))]
 pub(crate) mod scan;
 pub(crate) mod sleep;
+
+#[cfg(all(feature = "subrating", feature = "_no_subrating"))]
+compile_error!("You may not enable feature `subrating` on unsupported platforms!");
 
 /// Max number of connections of a keyboard's BLE stack; a dongle sizes its
 /// own — see [`crate::dongle::Dongle`].
@@ -146,12 +155,19 @@ where
 }
 
 #[cfg(feature = "split")]
-impl<'a, C> Runnable for BleTransport<'a, C>
-where
-    C: Controller
+impl<
+    'a,
+    #[cfg(not(feature = "subrating"))] C: Controller
         + ControllerCmdAsync<LeSetPhy>
         + ControllerCmdSync<LeReadLocalSupportedFeatures>
         + ControllerCmdSync<bt_hci::cmd::le::LeSetScanParams>,
+    #[cfg(feature = "subrating")] C: Controller
+        + ControllerCmdAsync<LeSetPhy>
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + ControllerCmdSync<bt_hci::cmd::le::LeSetScanParams>
+        + ControllerCmdSync<LeSetHostFeature>
+        + ControllerCmdAsync<LeSubrateRequest>,
+> Runnable for BleTransport<'a, C>
 {
     async fn run(&mut self) -> ! {
         // Load the preferred connection from storage
@@ -193,15 +209,19 @@ where
 
 /// Owns the GATT server and the profile manager, and advertises→connects→
 /// serves forever, joined with the stack runner and the sleep manager.
-async fn run_ble_keyboard<#[cfg(feature = "host")] 'r, C>(
+async fn run_ble_keyboard<
+    #[cfg(feature = "host")] 'r,
+    #[cfg(not(feature = "subrating"))] C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
+    #[cfg(feature = "subrating")] C: Controller
+        + ControllerCmdAsync<LeSetPhy>
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + ControllerCmdSync<LeSetHostFeature>,
+>(
     stack: &Stack<'_, C, DefaultPacketPool>,
     device_config: &DeviceConfig<'static>,
     config: &BleBatteryConfig<'static>,
     #[cfg(feature = "host")] host_service: Option<&'r crate::host::HostService<'r>>,
-) -> !
-where
-    C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
-{
+) -> ! {
     let product_name = device_config.product_name;
     #[cfg(feature = "_nrf_ble")]
     let serial_number = crate::ble::nrf::get_serial_number();
@@ -259,6 +279,11 @@ where
     let profile_manager = &mut profile_manager;
 
     let connection_loop = async {
+        // Subrating: set host feature flag BEFORE ANY CONNECTIONS
+        // This must run concurrently with the ble_task runner (which processes HCI commands).
+        #[cfg(feature = "subrating")]
+        init_subrating_host_feature(stack).await;
+
         loop {
             // On the dongle slot, advertise directed to the bonded dongle or
             // as a seeking broadcast; on the normal profiles, plain HID.
@@ -378,6 +403,23 @@ where
     unreachable!("BleTransport sub-tasks must run forever")
 }
 
+/// Initialize subrating host support.
+///
+/// **Must** be called concurrently with `ble_task()` (the runner processes the
+/// HCI command) and **before** any advertising, scanning or connecting, because
+/// the controller only applies the feature flag to connections established after
+/// it is set.
+#[cfg(feature = "subrating")]
+pub(crate) async fn init_subrating_host_feature<C: Controller + ControllerCmdSync<LeSetHostFeature>>(
+    stack: &Stack<'_, C, impl PacketPool>,
+) {
+    const CONN_SUBRATING_HOST_BIT: u8 = 38;
+    let cmd = LeSetHostFeature::new(CONN_SUBRATING_HOST_BIT, 1);
+    if let Err(e) = stack.command(cmd).await {
+        error!("[Host] error setting subrating host feature flag: {:?}", e);
+    }
+}
+
 /// NoopHandler is used on the device which never scans,
 /// such as a split peripheral or a normal keyboard.
 pub(crate) struct NoopHandler;
@@ -398,10 +440,7 @@ pub(crate) async fn wait_for_stack_started() {
 }
 
 /// This is a background task that is required to run forever alongside any other BLE tasks.
-pub(crate) async fn ble_task<C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool, E: EventHandler>(
-    mut runner: Runner<'_, C, P>,
-    handler: &E,
-) {
+pub(crate) async fn ble_task<C: Controller, P: PacketPool, E: EventHandler>(mut runner: Runner<'_, C, P>, handler: &E) {
     STACK_STARTED.signal(());
     loop {
         if let Err(e) = runner.run_with_handler(handler).await {
@@ -417,6 +456,8 @@ pub(crate) async fn ble_task<C: Controller + ControllerCmdAsync<LeSetPhy>, P: Pa
 /// This is how we interact with read and write requests.
 async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, DefaultPacketPool>) -> Result<(), Error> {
     let level = server.battery_service.level;
+    #[cfg(feature = "split")]
+    let peripheral_levels = server.peripheral_battery_services.levels;
     let output_keyboard = server.hid_service.output_keyboard;
     let hid_control_point = server.hid_service.hid_control_point;
     let input_keyboard = server.hid_service.input_keyboard;
@@ -481,7 +522,17 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                             let value = server.get(&level);
                             debug!("Read GATT Event to Level: {:?}", value);
                         } else {
-                            debug!("Read GATT Event to Unknown: {:?}", event.handle());
+                            #[cfg(feature = "split")]
+                            let peripheral_level =
+                                peripheral_levels.iter().find(|level| event.handle() == level.handle);
+                            #[cfg(not(feature = "split"))]
+                            let peripheral_level: Option<&Characteristic<u8>> = None;
+                            if let Some(peripheral_level) = peripheral_level {
+                                let value = server.get(peripheral_level);
+                                debug!("Read GATT Event to Peripheral Level: {:?}", value);
+                            } else {
+                                debug!("Read GATT Event to Unknown: {:?}", event.handle());
+                            }
                         }
 
                         if conn.raw().security_level()?.encrypted() {
@@ -521,6 +572,19 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                             || event.handle() == media.cccd_handle.expect("No CCCD for media report")
                             || event.handle() == system_control.cccd_handle.expect("No CCCD for system report")
                             || event.handle() == level.cccd_handle.expect("No CCCD for battery level")
+                            || {
+                                #[cfg(feature = "split")]
+                                {
+                                    peripheral_levels.iter().any(|level| {
+                                        event.handle()
+                                            == level.cccd_handle.expect("No CCCD for peripheral battery level")
+                                    })
+                                }
+                                #[cfg(not(feature = "split"))]
+                                {
+                                    false
+                                }
+                            }
                         {
                             cccd_updated = true;
                         } else if event.handle() == hid_control_point.handle {
@@ -706,13 +770,22 @@ pub(crate) async fn set_conn_params<
     for interval in [Duration::from_millis(15), Duration::from_micros(7500)] {
         // Wait 5 seconds before each request to avoid connection drop
         embassy_time::Timer::after_secs(5).await;
+
+        // We need to let the central sleep for long periods of time when the
+        // split connection is subrated to get the power savings.
+        #[cfg(feature = "subrating")]
+        let max_latency = subrating::HOST_MAX_LATENCY;
+
+        #[cfg(not(feature = "subrating"))]
+        let max_latency = 30;
+
         update_conn_params(
             stack,
             conn.raw(),
             &RequestedConnParams {
                 min_connection_interval: interval,
                 max_connection_interval: interval,
-                max_latency: 30,
+                max_latency,
                 supervision_timeout: Duration::from_secs(10),
                 ..Default::default()
             },
@@ -747,6 +820,10 @@ async fn serve_keyboard_connection<
     let mut ble_hid_server = BleHidServer::new(server, conn);
     let mut ble_led_reader = BleLedReader;
     let mut ble_battery_server = config.enabled.then(|| BleBatteryServer::new(server, conn));
+    #[cfg(feature = "split")]
+    let mut ble_peripheral_battery_server = crate::SPLIT_BATTERY_PERIPHERAL_IDS
+        .first()
+        .map(|_| BlePeripheralBatteryServer::new(server, conn));
 
     // CCCD lookup uses cached bond info to avoid a cancellable flash read while
     // this future is racing other arms of an outer `select`.
@@ -760,18 +837,29 @@ async fn serve_keyboard_connection<
         }
     }
 
-    let host_phy = if cfg!(feature = "use_1m_phy") {
+    // `use_1m_phy` exists for legacy host adapters that cannot do 2M.
+    // Always use 2M for the dongle link.
+    #[cfg(feature = "dongle")]
+    let dongle_link = crate::state::current_profile() == crate::ble::profile::DONGLE_PROFILE;
+    #[cfg(not(feature = "dongle"))]
+    let dongle_link = false;
+    let host_phy = if cfg!(feature = "use_1m_phy") && !dongle_link {
         PhyKind::Le1M
     } else {
         PhyKind::Le2M
     };
     update_ble_phy(stack, conn.raw(), host_phy).await;
 
+    #[cfg(not(feature = "split"))]
+    let battery_task = ble_battery_server.run();
+    #[cfg(feature = "split")]
+    let battery_task = embassy_futures::join::join(ble_battery_server.run(), ble_peripheral_battery_server.run());
+
     let communication_task = async {
         if let Either3::First(e) = select3(
             gatt_events_task(server, conn),
             set_conn_params(stack, conn),
-            ble_battery_server.run(),
+            battery_task,
         )
         .await
         {
