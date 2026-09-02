@@ -61,6 +61,7 @@ pub(crate) static LOCK_LED_STATES: core::sync::atomic::AtomicU8 = core::sync::at
 struct LastKeyboardModifierReport {
     modifiers: ModifierCombination,
     sticky_contributed: ModifierCombination,
+    pressed_intent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2069,6 +2070,7 @@ impl<'a> Keyboard<'a> {
         self.last_modifier_report = LastKeyboardModifierReport {
             modifiers: resolution.modifiers,
             sticky_contributed: resolution.sticky_contributed,
+            pressed_intent: pressed,
         };
 
         // Yield once after sending the report to channel

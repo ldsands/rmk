@@ -79,6 +79,20 @@ expect = [
 ]
 
 [[test]]
+name = "caps_word_ownership_survives_matching_sticky_release"
+steps = [
+  { tap = { pos = [1, 0], duration = 10 } },
+  { press = [0, 6] },
+  { press = [0, 3] },
+  { release = [0, 6] },
+  { release = [0, 3] },
+]
+expect = [
+  ["LShift", "A"],
+  [],
+]
+
+[[test]]
 name = "live_modifier_release_does_not_release_held_osl"
 steps = [
   { press = [0, 5] },

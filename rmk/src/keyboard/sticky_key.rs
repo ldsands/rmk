@@ -665,7 +665,9 @@ impl Keyboard<'_> {
             self.remove_sticky_modifier_entry(index);
             final_effective = ModifierCombination::new();
         }
-        let current_non_sticky = self.resolve_modifier_breakdown(false).non_sticky;
+        let current_non_sticky = self
+            .resolve_modifier_breakdown(self.last_modifier_report.pressed_intent)
+            .non_sticky;
         self.send_sticky_modifier_live_release(old_effective, final_effective, current_non_sticky)
             .await;
         true
@@ -923,7 +925,9 @@ impl Keyboard<'_> {
                 let StickyEffectState::Modifier(_) = entry.effect_state else {
                     unreachable!("modifier action must own modifier effect state");
                 };
-                let current_non_sticky = self.resolve_modifier_breakdown(false).non_sticky;
+                let current_non_sticky = self
+                    .resolve_modifier_breakdown(self.last_modifier_report.pressed_intent)
+                    .non_sticky;
                 let removed_from_host = modifiers & self.last_modifier_report.sticky_contributed & !current_non_sticky;
                 if removed_from_host.into_bits() != 0 {
                     self.send_keyboard_report_with_resolved_modifiers(false).await;
