@@ -30,7 +30,7 @@ use crate::keyboard::combo::Combo;
 use crate::keyboard::fork::ActiveFork;
 use crate::keyboard::held_buffer::{HeldBuffer, HeldKey, KeyState};
 use crate::keyboard::mouse::{MouseAction, MouseState};
-use crate::keyboard::sticky_key::{ModifierProducerSource, StickyKeyState};
+use crate::keyboard::sticky_key::{StickyKeySource, StickyKeyState};
 use crate::keyboard_macros::MacroOperation;
 use crate::keymap::KeyMap;
 use crate::{COMBO_MAX_NUM, FORK_MAX_NUM, MACRO_SPACE_SIZE, boot};
@@ -504,12 +504,7 @@ impl<'a> Keyboard<'a> {
                     event_time,
                     timeout_time,
                 );
-                let held_key = match (combo_index, key_action) {
-                    (Some(index), KeyAction::Sticky(Action::Modifier(_), _)) => {
-                        held_key.with_sticky_modifier_combo_index(index as u16)
-                    }
-                    _ => held_key,
-                };
+                let held_key = combo_index.map_or(held_key, |index| held_key.with_combo_index(index as u16));
                 self.held_buffer.push(held_key);
             }
             KeyBehaviorDecision::Ignore => {
@@ -651,15 +646,15 @@ impl<'a> Keyboard<'a> {
                     // Releasing the current key, will always be tapping, because timeout isn't here
                     let mut resolved = false;
                     if let Some(mut held_key) = self.held_buffer.remove_if(|k| k.event.pos == pos) {
-                        // A buffered combo-produced Sticky modifier must keep
-                        // its stable action and producer identity. Every other
-                        // buffered key still follows layer changes while held.
-                        let key_action = if held_key.sticky_modifier_combo_index.is_some() {
+                        // A buffered combo output must keep its stable action
+                        // and producer identity. Physical keys still follow
+                        // layer changes while held.
+                        let key_action = if held_key.combo_index.is_some() {
                             held_key.action
                         } else {
                             self.keymap.get_action_with_layer_cache(held_key.event)
                         };
-                        if held_key.sticky_modifier_combo_index.is_none() && key_action != held_key.action {
+                        if held_key.combo_index.is_none() && key_action != held_key.action {
                             keyboard_state_updated = true;
                         }
                         debug!("Processing current key before releasing: {:?}", held_key.event);
@@ -672,16 +667,15 @@ impl<'a> Keyboard<'a> {
                                     self.process_key_action_tap(action, held_key.event).await;
                                 }
                                 KeyAction::Sticky(action, profile) => {
-                                    let modifier_source = held_key.sticky_modifier_combo_index.map_or(
-                                        ModifierProducerSource::Direct(held_key.event.pos),
-                                        ModifierProducerSource::Combo,
-                                    );
+                                    let source = held_key
+                                        .combo_index
+                                        .map_or(StickyKeySource::Direct(held_key.event.pos), StickyKeySource::Combo);
                                     self.process_action_sticky_key(
                                         action,
                                         profile,
                                         held_key.event,
                                         held_key.press_time,
-                                        modifier_source,
+                                        source,
                                     )
                                     .await;
                                 }
@@ -741,7 +735,7 @@ impl<'a> Keyboard<'a> {
 
                     if trigger_normal && let Some(held_key) = self.held_buffer.remove_if(|k| k.event.pos == pos) {
                         debug!("Cleaning buffered normal key");
-                        let action = if keyboard_state_updated && held_key.sticky_modifier_combo_index.is_none() {
+                        let action = if keyboard_state_updated && held_key.combo_index.is_none() {
                             self.keymap.get_action_with_layer_cache(held_key.event)
                         } else {
                             held_key.action
@@ -753,7 +747,7 @@ impl<'a> Keyboard<'a> {
                         self.process_key_action_inner(
                             &action,
                             held_key.event,
-                            held_key.sticky_modifier_combo_index.map(usize::from),
+                            held_key.combo_index.map(usize::from),
                             held_key.press_time,
                         )
                         .await;
@@ -967,10 +961,10 @@ impl<'a> Keyboard<'a> {
                     keyboard_event: event,
                 })
                 .await;
-                let modifier_source = combo_index.map_or(ModifierProducerSource::Direct(event.pos), |index| {
-                    ModifierProducerSource::Combo(index as u16)
+                let source = combo_index.map_or(StickyKeySource::Direct(event.pos), |index| {
+                    StickyKeySource::Combo(index as u16)
                 });
-                self.process_action_sticky_key(action, profile, event, event_time, modifier_source)
+                self.process_action_sticky_key(action, profile, event, event_time, source)
                     .await;
                 self.sticky_key_state.finish_buffered_claim();
             }
@@ -2351,6 +2345,68 @@ mod test {
     async fn force_timeout_first_hold(keyboard: &mut Keyboard<'static>) {
         let key = keyboard.next_buffered_key().unwrap();
         keyboard.process_buffered_key(key).await;
+    }
+
+    #[test]
+    fn buffered_combo_sticky_layer_keeps_action_and_release_identity() {
+        let main = async {
+            let mut config = BehaviorConfig::default();
+            config.sticky_key.default_profile.release_after_hold =
+                crate::config::StickyKeyHoldDuration::from_duration(Duration::from_millis(0));
+            let mut keyboard = create_test_keyboard_with_config(config);
+            let action = osl!(1);
+            let press = KeyboardEvent::key(0, 0, true);
+
+            keyboard.held_buffer.push(
+                HeldKey::new(
+                    press,
+                    action,
+                    KeyState::Pressed(MorsePattern::default()),
+                    Instant::now(),
+                    Instant::now(),
+                )
+                .with_combo_index(3),
+            );
+            keyboard.fire_held_non_morse_keys().await;
+            assert!(keyboard.keymap.is_layer_active(1));
+
+            keyboard
+                .process_key_action(&action, KeyboardEvent::key(0, 1, false), Some(3), Instant::now())
+                .await;
+            assert!(!keyboard.keymap.is_layer_active(1));
+        };
+        block_on(main);
+    }
+
+    #[test]
+    fn buffered_combo_sticky_tap_key_keeps_action_and_release_identity() {
+        let main = async {
+            let mut config = BehaviorConfig::default();
+            config.sticky_key.default_profile.release_after_hold =
+                crate::config::StickyKeyHoldDuration::from_duration(Duration::from_millis(0));
+            let mut keyboard = create_test_keyboard_with_config(config);
+            let action = KeyAction::Sticky(Action::KeyWithModifier(HidKeyCode::Tab, ModifierCombination::LALT), 0);
+            let press = KeyboardEvent::key(0, 0, true);
+
+            keyboard.held_buffer.push(
+                HeldKey::new(
+                    press,
+                    action,
+                    KeyState::Pressed(MorsePattern::default()),
+                    Instant::now(),
+                    Instant::now(),
+                )
+                .with_combo_index(4),
+            );
+            keyboard.fire_held_non_morse_keys().await;
+            assert!(keyboard.held_keycodes.contains(&HidKeyCode::Tab));
+
+            keyboard
+                .process_key_action(&action, KeyboardEvent::key(0, 1, false), Some(4), Instant::now())
+                .await;
+            assert!(!keyboard.held_keycodes.contains(&HidKeyCode::Tab));
+        };
+        block_on(main);
     }
 
     fn create_test_keyboard_with_forks(fork1: Fork, fork2: Fork) -> Keyboard<'static> {

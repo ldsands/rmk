@@ -40,7 +40,7 @@ struct StickyEntry {
     /// Canonical identity of the held action. Effect code derives its shape
     /// from this value instead of parallel modifier/layer/tap-key slots.
     action: Action,
-    source: KeyboardEventPos,
+    source: StickyKeySource,
     policy: StickyKeyPolicy,
     phase: StickyPhase,
     repeat_count: u16,
@@ -60,22 +60,12 @@ enum PhysicalRelease {
 }
 
 impl StickyEntry {
-    fn new(action: Action, source: KeyboardEventPos, policy: StickyKeyPolicy, pressed_at: Instant) -> Self {
-        Self::new_with_modifier_source(
-            action,
-            source,
-            policy,
-            pressed_at,
-            ModifierProducerSource::Direct(source),
-        )
-    }
-
-    fn new_with_modifier_source(
+    fn new(
         action: Action,
-        source: KeyboardEventPos,
+        source: StickyKeySource,
+        event_pos: KeyboardEventPos,
         policy: StickyKeyPolicy,
         pressed_at: Instant,
-        modifier_source: ModifierProducerSource,
     ) -> Self {
         let (phase, timing_marker) = Self::press_state(policy, pressed_at, pressed_at);
         Self {
@@ -88,9 +78,9 @@ impl StickyEntry {
             buffered_claim: false,
             effect_state: match action {
                 Action::Modifier(modifiers) => {
-                    StickyEffectState::Modifier(StickyModifierEffect::new(modifiers, modifier_source))
+                    StickyEffectState::Modifier(StickyModifierEffect::new(modifiers, source))
                 }
-                _ => StickyEffectState::ActionOnly,
+                _ => StickyEffectState::ActionOnly(event_pos),
             },
         }
     }
@@ -98,11 +88,11 @@ impl StickyEntry {
     fn new_modifier(
         modifiers: ModifierCombination,
         source: KeyboardEventPos,
-        producer_source: ModifierProducerSource,
+        producer_source: StickyKeySource,
         policy: StickyKeyPolicy,
         pressed_at: Instant,
     ) -> Self {
-        Self::new_with_modifier_source(Action::Modifier(modifiers), source, policy, pressed_at, producer_source)
+        Self::new(Action::Modifier(modifiers), producer_source, source, policy, pressed_at)
     }
 
     fn is_modifier(&self) -> bool {
@@ -134,7 +124,7 @@ impl StickyEntry {
     fn add_modifier_producer(
         &mut self,
         modifiers: ModifierCombination,
-        source: ModifierProducerSource,
+        source: StickyKeySource,
     ) -> ModifierProducerInsert {
         let inserted = self.modifier_effect_mut().begin_press(modifiers, source);
         if inserted == ModifierProducerInsert::Added {
@@ -146,7 +136,7 @@ impl StickyEntry {
     fn on_exact_modifier_release(
         &mut self,
         modifiers: ModifierCombination,
-        source: ModifierProducerSource,
+        source: StickyKeySource,
     ) -> ModifierProducerRelease {
         let release = self.modifier_effect_mut().on_exact_release(modifiers, source);
         if matches!(release, ModifierProducerRelease::Released { .. }) {
@@ -167,14 +157,14 @@ impl StickyEntry {
     fn modifier_effect(&self) -> &StickyModifierEffect {
         match &self.effect_state {
             StickyEffectState::Modifier(effect) => effect,
-            StickyEffectState::ActionOnly => unreachable!("modifier action must own modifier effect state"),
+            StickyEffectState::ActionOnly(_) => unreachable!("modifier action must own modifier effect state"),
         }
     }
 
     fn modifier_effect_mut(&mut self) -> &mut StickyModifierEffect {
         match &mut self.effect_state {
             StickyEffectState::Modifier(effect) => effect,
-            StickyEffectState::ActionOnly => unreachable!("modifier action must own modifier effect state"),
+            StickyEffectState::ActionOnly(_) => unreachable!("modifier action must own modifier effect state"),
         }
     }
 
@@ -198,8 +188,17 @@ impl StickyEntry {
         }
     }
 
-    fn begin_press(&mut self, source: KeyboardEventPos, policy: StickyKeyPolicy, pressed_at: Instant) {
+    fn begin_press(
+        &mut self,
+        source: StickyKeySource,
+        event_pos: KeyboardEventPos,
+        policy: StickyKeyPolicy,
+        pressed_at: Instant,
+    ) {
         self.source = source;
+        if let StickyEffectState::ActionOnly(release_pos) = &mut self.effect_state {
+            *release_pos = event_pos;
+        }
         self.policy = policy;
         (self.phase, self.timing_marker) = Self::press_state(policy, pressed_at, pressed_at);
         self.buffered_claim = false;
@@ -208,7 +207,7 @@ impl StickyEntry {
     /// Add a producer to the current modifier chord without forgetting how
     /// long the chord has already been held. The latest producer still selects
     /// the policy, but its threshold is measured from the chord's first press.
-    fn begin_modifier_press(&mut self, source: KeyboardEventPos, policy: StickyKeyPolicy, pressed_at: Instant) {
+    fn begin_modifier_press(&mut self, source: StickyKeySource, policy: StickyKeyPolicy, pressed_at: Instant) {
         let chord_started_at = match self.phase {
             StickyPhase::Pressed => self
                 .timing_marker
@@ -225,7 +224,7 @@ impl StickyEntry {
         self.buffered_claim = false;
     }
 
-    fn on_physical_release(&mut self, owner: Option<KeyboardEventPos>, now: Instant) -> PhysicalRelease {
+    fn on_physical_release(&mut self, owner: Option<StickyKeySource>, now: Instant) -> PhysicalRelease {
         if owner.is_some_and(|owner| owner != self.source) {
             return PhysicalRelease::Ignored;
         }
@@ -275,7 +274,10 @@ impl StickyEntry {
     }
 
     fn claim_buffered_press(&mut self, source: KeyboardEventPos) {
-        if self.phase == StickyPhase::Latched && self.source != source && self.trigger_for_key(true) {
+        if self.phase == StickyPhase::Latched
+            && self.source != StickyKeySource::Direct(source)
+            && self.trigger_for_key(true)
+        {
             self.buffered_claim = true;
             self.timing_marker = None;
         }
@@ -288,7 +290,7 @@ impl StickyEntry {
         }
     }
 
-    fn is_double_tap(&self, source: KeyboardEventPos, policy: StickyKeyPolicy) -> bool {
+    fn is_double_tap(&self, source: StickyKeySource, policy: StickyKeyPolicy) -> bool {
         self.phase == StickyPhase::Latched
             && self.source == source
             && policy.release_mode.intersects(StickyKeyReleaseMode::DOUBLE_TAP)
@@ -327,13 +329,13 @@ const MAX_ACTIVE_STICKY_KEYS: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct ModifierProducer {
-    source: ModifierProducerSource,
+    source: StickyKeySource,
     modifiers: ModifierCombination,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub(crate) enum ModifierProducerSource {
+pub(crate) enum StickyKeySource {
     /// A physical key, matched by its matrix position.
     Direct(KeyboardEventPos),
     /// A combo output, matched by its stable slot in the combo table.
@@ -369,7 +371,7 @@ struct StickyModifierEffect {
 }
 
 impl StickyModifierEffect {
-    fn new(modifiers: ModifierCombination, source: ModifierProducerSource) -> Self {
+    fn new(modifiers: ModifierCombination, source: StickyKeySource) -> Self {
         let mut producers = [None; MAX_STICKY_MODIFIER_PRODUCERS];
         producers[0] = Some(ModifierProducer { source, modifiers });
         Self {
@@ -378,11 +380,7 @@ impl StickyModifierEffect {
         }
     }
 
-    fn begin_press(
-        &mut self,
-        modifiers: ModifierCombination,
-        source: ModifierProducerSource,
-    ) -> ModifierProducerInsert {
+    fn begin_press(&mut self, modifiers: ModifierCombination, source: StickyKeySource) -> ModifierProducerInsert {
         let producer = ModifierProducer { source, modifiers };
         if let Some(slot) = self.producers.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(producer);
@@ -421,11 +419,7 @@ impl StickyModifierEffect {
         }
     }
 
-    fn on_exact_release(
-        &mut self,
-        modifiers: ModifierCombination,
-        source: ModifierProducerSource,
-    ) -> ModifierProducerRelease {
+    fn on_exact_release(&mut self, modifiers: ModifierCombination, source: StickyKeySource) -> ModifierProducerRelease {
         let exact = ModifierProducer { source, modifiers };
         let Some(index) = self.producers.iter().position(|producer| *producer == Some(exact)) else {
             return ModifierProducerRelease::Unmatched;
@@ -436,8 +430,8 @@ impl StickyModifierEffect {
 
 #[derive(Clone, Copy, Debug)]
 enum StickyEffectState {
-    /// Layer and tap-key effects are represented completely by `StickyEntry::action`.
-    ActionOnly,
+    /// Layer and tap-key effects also retain the position used for HID cleanup.
+    ActionOnly(KeyboardEventPos),
     /// Modifier effects additionally track physical and retained ownership.
     Modifier(StickyModifierEffect),
 }
@@ -535,7 +529,7 @@ impl Keyboard<'_> {
         profile: u8,
         event: KeyboardEvent,
         event_time: Instant,
-        modifier_source: ModifierProducerSource,
+        source: StickyKeySource,
     ) {
         let shape = match action {
             Action::Modifier(_) => StickyKeyShape::PureMod,
@@ -552,12 +546,15 @@ impl Keyboard<'_> {
         // and advance the same `StickyEntry` lifecycle.
         match action {
             Action::Modifier(modifiers) => {
-                self.process_modifier_effect(modifiers, policy, event, event_time, modifier_source)
+                self.process_modifier_effect(modifiers, policy, event, event_time, source)
                     .await
             }
-            Action::LayerOn(layer) => self.process_layer_effect(layer, policy, event, event_time).await,
+            Action::LayerOn(layer) => {
+                self.process_layer_effect(layer, policy, event, event_time, source)
+                    .await
+            }
             Action::KeyWithModifier(key, modifiers) => {
-                self.process_tap_key_effect(key, modifiers, policy, event, event_time)
+                self.process_tap_key_effect(key, modifiers, policy, event, event_time, source)
                     .await
             }
             _ => unreachable!("unsupported Sticky Key action rejected above"),
@@ -570,7 +567,7 @@ impl Keyboard<'_> {
         policy: StickyKeyPolicy,
         event: KeyboardEvent,
         event_time: Instant,
-        producer_source: ModifierProducerSource,
+        producer_source: StickyKeySource,
     ) {
         if event.pressed {
             if let Some(index) = self.sticky_key_state.tap_key_index() {
@@ -578,7 +575,7 @@ impl Keyboard<'_> {
             }
             let modifier_index = self.sticky_key_state.modifier_index();
             if modifier_index.is_some_and(|index| {
-                self.sticky_key_state.active[index].is_some_and(|entry| entry.is_double_tap(event.pos, policy))
+                self.sticky_key_state.active[index].is_some_and(|entry| entry.is_double_tap(producer_source, policy))
             }) {
                 self.release_sticky_entry(modifier_index.expect("modifier checked above"))
                     .await;
@@ -596,7 +593,7 @@ impl Keyboard<'_> {
                 let entry = self.sticky_key_state.active[index]
                     .as_mut()
                     .expect("modifier index must contain an entry");
-                entry.begin_modifier_press(event.pos, policy, event_time);
+                entry.begin_modifier_press(producer_source, policy, event_time);
             } else if self
                 .sticky_key_state
                 .insert(StickyEntry::new_modifier(
@@ -680,6 +677,7 @@ impl Keyboard<'_> {
         policy: StickyKeyPolicy,
         event: KeyboardEvent,
         event_time: Instant,
+        source: StickyKeySource,
     ) {
         if event.pressed {
             if let Some(index) = self.sticky_key_state.tap_key_index() {
@@ -694,7 +692,7 @@ impl Keyboard<'_> {
                 let previous = self.sticky_key_state.active[index]
                     .as_ref()
                     .expect("layer index must contain an entry");
-                if previous.is_double_tap(event.pos, policy) {
+                if previous.is_double_tap(source, policy) {
                     self.release_sticky_entry(index).await;
                     return;
                 }
@@ -703,14 +701,20 @@ impl Keyboard<'_> {
                     self.sticky_key_state.active[index]
                         .as_mut()
                         .expect("layer index must contain an entry")
-                        .begin_press(event.pos, policy, event_time);
+                        .begin_press(source, event.pos, policy, event_time);
                     return;
                 }
                 self.release_sticky_entry(index).await;
             }
             if self
                 .sticky_key_state
-                .insert(StickyEntry::new(Action::LayerOn(layer), event.pos, policy, event_time))
+                .insert(StickyEntry::new(
+                    Action::LayerOn(layer),
+                    source,
+                    event.pos,
+                    policy,
+                    event_time,
+                ))
                 .is_err()
             {
                 warn!("No capacity for Sticky layer action");
@@ -721,7 +725,7 @@ impl Keyboard<'_> {
             let release = self.sticky_key_state.active[index]
                 .as_mut()
                 .expect("layer index must contain an entry")
-                .on_physical_release(Some(event.pos), event_time)
+                .on_physical_release(Some(source), event_time)
                 == PhysicalRelease::Released;
             if release {
                 self.release_sticky_entry(index).await;
@@ -736,6 +740,7 @@ impl Keyboard<'_> {
         policy: StickyKeyPolicy,
         event: KeyboardEvent,
         event_time: Instant,
+        source: StickyKeySource,
     ) {
         let action = Action::KeyWithModifier(key, modifiers);
 
@@ -749,11 +754,11 @@ impl Keyboard<'_> {
             let tap_key_index = self.sticky_key_state.tap_key_index();
             let same_tap_key = tap_key_index.is_some_and(|index| {
                 self.sticky_key_state.active[index]
-                    .is_some_and(|entry| entry.source == event.pos && entry.action == action)
+                    .is_some_and(|entry| entry.source == source && entry.action == action)
             });
             if same_tap_key
                 && tap_key_index.is_some_and(|index| {
-                    self.sticky_key_state.active[index].is_some_and(|entry| entry.is_double_tap(event.pos, policy))
+                    self.sticky_key_state.active[index].is_some_and(|entry| entry.is_double_tap(source, policy))
                 })
             {
                 self.release_sticky_entry(tap_key_index.expect("tap key checked above"))
@@ -773,11 +778,11 @@ impl Keyboard<'_> {
                 if policy.max_repeat > 0 && entry.repeat_count > policy.max_repeat {
                     deactivate = true;
                 } else {
-                    entry.begin_press(event.pos, policy, event_time);
+                    entry.begin_press(source, event.pos, policy, event_time);
                 }
             } else if self
                 .sticky_key_state
-                .insert(StickyEntry::new(action, event.pos, policy, event_time))
+                .insert(StickyEntry::new(action, source, event.pos, policy, event_time))
                 .is_err()
             {
                 warn!("No capacity for Sticky tap-key action");
@@ -796,14 +801,14 @@ impl Keyboard<'_> {
             }
         } else if let Some(index) = self.sticky_key_state.tap_key_index() {
             let release_physical_key = self.sticky_key_state.active[index].is_some_and(|entry| {
-                entry.source == event.pos
+                entry.source == source
                     && matches!(entry.phase, StickyPhase::Pressed | StickyPhase::PressDeadlineInactive)
             });
             if release_physical_key {
                 self.sticky_key_state.active[index]
                     .as_mut()
                     .expect("tap key index must contain an entry")
-                    .on_physical_release(Some(event.pos), event_time);
+                    .on_physical_release(Some(source), event_time);
                 self.process_action_key(key, event).await;
             }
         }
@@ -928,12 +933,15 @@ impl Keyboard<'_> {
                 self.keymap.deactivate_layer_if_active(layer);
             }
             Action::KeyWithModifier(key, _) => {
+                let StickyEffectState::ActionOnly(release_pos) = entry.effect_state else {
+                    unreachable!("tap-key action must own its release position");
+                };
                 if matches!(entry.phase, StickyPhase::Pressed | StickyPhase::PressDeadlineInactive) {
                     self.process_action_key(
                         key,
                         KeyboardEvent {
                             pressed: false,
-                            pos: entry.source,
+                            pos: release_pos,
                         },
                     )
                     .await;
@@ -963,8 +971,8 @@ mod tests {
         KeyboardEventPos::key_pos(col, 0)
     }
 
-    fn direct(col: u8) -> ModifierProducerSource {
-        ModifierProducerSource::Direct(pos(col))
+    fn direct(col: u8) -> StickyKeySource {
+        StickyKeySource::Direct(pos(col))
     }
 
     fn policy(release_mode: StickyKeyReleaseMode) -> StickyKeyPolicy {
@@ -983,7 +991,13 @@ mod tests {
         policy: StickyKeyPolicy,
         pressed_at: Instant,
     ) -> StickyEntry {
-        StickyEntry::new(Action::Modifier(modifiers), source, policy, pressed_at)
+        StickyEntry::new(
+            Action::Modifier(modifiers),
+            StickyKeySource::Direct(source),
+            source,
+            policy,
+            pressed_at,
+        )
     }
 
     #[test]
@@ -996,7 +1010,7 @@ mod tests {
             pressed_at,
         );
         latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
-        latch.begin_modifier_press(pos(1), policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE), pressed_at);
+        latch.begin_modifier_press(direct(1), policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE), pressed_at);
 
         assert_eq!(
             latch.on_exact_modifier_release(ModifierCombination::LCTRL, direct(0)),
@@ -1039,7 +1053,7 @@ mod tests {
             pressed_at,
         );
         latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
-        latch.begin_modifier_press(pos(1), policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE), pressed_at);
+        latch.begin_modifier_press(direct(1), policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE), pressed_at);
         latch.mark_foreign_key();
 
         assert!(matches!(
@@ -1161,7 +1175,7 @@ mod tests {
         let release_time = first_press + Duration::from_millis(400);
         let mut latch = modifier_entry(ModifierCombination::LCTRL, pos(0), hold_policy, first_press);
         latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
-        latch.begin_modifier_press(pos(1), hold_policy, second_press);
+        latch.begin_modifier_press(direct(1), hold_policy, second_press);
 
         assert!(matches!(
             latch.on_exact_modifier_release(ModifierCombination::LSHIFT, direct(1)),
@@ -1181,7 +1195,7 @@ mod tests {
 
         let mut reverse_release = modifier_entry(ModifierCombination::LCTRL, pos(0), hold_policy, first_press);
         reverse_release.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
-        reverse_release.begin_modifier_press(pos(1), hold_policy, second_press);
+        reverse_release.begin_modifier_press(direct(1), hold_policy, second_press);
         assert!(matches!(
             reverse_release.on_exact_modifier_release(ModifierCombination::LCTRL, direct(0)),
             ModifierProducerRelease::Released {
@@ -1211,7 +1225,7 @@ mod tests {
         let first_press = Instant::now();
         let mut latch = modifier_entry(ModifierCombination::LCTRL, pos(0), first_policy, first_press);
         latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
-        latch.begin_modifier_press(pos(1), latest_policy, first_press + Duration::from_millis(250));
+        latch.begin_modifier_press(direct(1), latest_policy, first_press + Duration::from_millis(250));
 
         assert_eq!(
             latch.on_physical_release(None, first_press + Duration::from_millis(400)),
@@ -1224,7 +1238,7 @@ mod tests {
             DeadlineDisposition::Deferred
         );
         timeout_first.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
-        timeout_first.begin_modifier_press(pos(1), latest_policy, first_press + Duration::from_millis(400));
+        timeout_first.begin_modifier_press(direct(1), latest_policy, first_press + Duration::from_millis(400));
         assert_eq!(
             timeout_first.on_physical_release(None, first_press + Duration::from_millis(450)),
             PhysicalRelease::Latched
@@ -1250,7 +1264,7 @@ mod tests {
             }
             disabled_then_enabled.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
             disabled_then_enabled.begin_modifier_press(
-                pos(1),
+                direct(1),
                 enabled_policy,
                 first_press + Duration::from_millis(400),
             );
@@ -1269,7 +1283,7 @@ mod tests {
             }
             enabled_then_disabled.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
             enabled_then_disabled.begin_modifier_press(
-                pos(1),
+                direct(1),
                 disabled_policy,
                 first_press + Duration::from_millis(600),
             );
@@ -1313,6 +1327,7 @@ mod tests {
         );
         let layer = StickyEntry::new(
             Action::LayerOn(2),
+            direct(1),
             pos(1),
             policy(StickyKeyReleaseMode::LAYER_EXIT),
             Instant::now(),
@@ -1338,6 +1353,7 @@ mod tests {
 
         let overflow = StickyEntry::new(
             Action::KeyWithModifier(HidKeyCode::A, ModifierCombination::LSHIFT),
+            direct(2),
             pos(2),
             policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE),
             Instant::now(),
@@ -1351,18 +1367,18 @@ mod tests {
         let mut direct_effect = StickyModifierEffect::new(modifiers, direct(1));
 
         assert_eq!(
-            direct_effect.on_exact_release(modifiers, ModifierProducerSource::Combo(0)),
+            direct_effect.on_exact_release(modifiers, StickyKeySource::Combo(0)),
             ModifierProducerRelease::Unmatched
         );
         assert_eq!(direct_effect.effective(), modifiers);
 
-        let mut combo_effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(1));
+        let mut combo_effect = StickyModifierEffect::new(modifiers, StickyKeySource::Combo(1));
         assert_eq!(
             combo_effect.on_exact_release(modifiers, direct(0)),
             ModifierProducerRelease::Unmatched
         );
         assert_eq!(
-            combo_effect.on_exact_release(modifiers, ModifierProducerSource::Combo(0)),
+            combo_effect.on_exact_release(modifiers, StickyKeySource::Combo(0)),
             ModifierProducerRelease::Unmatched
         );
         assert_eq!(combo_effect.effective(), modifiers);
@@ -1371,17 +1387,17 @@ mod tests {
     #[test]
     fn same_mask_combo_siblings_release_only_their_own_slot() {
         let modifiers = ModifierCombination::LSHIFT;
-        let mut effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(0));
+        let mut effect = StickyModifierEffect::new(modifiers, StickyKeySource::Combo(0));
         assert_eq!(
-            effect.begin_press(modifiers, ModifierProducerSource::Combo(3)),
+            effect.begin_press(modifiers, StickyKeySource::Combo(3)),
             ModifierProducerInsert::Added
         );
 
         assert!(matches!(
-            effect.on_exact_release(modifiers, ModifierProducerSource::Combo(0)),
+            effect.on_exact_release(modifiers, StickyKeySource::Combo(0)),
             ModifierProducerRelease::Released {
                 removed: ModifierProducer {
-                    source: ModifierProducerSource::Combo(0),
+                    source: StickyKeySource::Combo(0),
                     modifiers: removed_modifiers,
                 },
                 producers_remain: true,
@@ -1389,10 +1405,10 @@ mod tests {
             } if removed_modifiers == modifiers
         ));
         assert!(matches!(
-            effect.on_exact_release(modifiers, ModifierProducerSource::Combo(3)),
+            effect.on_exact_release(modifiers, StickyKeySource::Combo(3)),
             ModifierProducerRelease::Released {
                 removed: ModifierProducer {
-                    source: ModifierProducerSource::Combo(3),
+                    source: StickyKeySource::Combo(3),
                     modifiers: removed_modifiers,
                 },
                 producers_remain: false,
@@ -1404,20 +1420,20 @@ mod tests {
     #[test]
     fn eight_combo_slots_report_the_exact_removed_owner() {
         let modifiers = ModifierCombination::LCTRL;
-        let mut effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(0));
+        let mut effect = StickyModifierEffect::new(modifiers, StickyKeySource::Combo(0));
         for index in 1..MAX_STICKY_MODIFIER_PRODUCERS {
             assert_eq!(
-                effect.begin_press(modifiers, ModifierProducerSource::Combo(index as u16)),
+                effect.begin_press(modifiers, StickyKeySource::Combo(index as u16)),
                 ModifierProducerInsert::Added
             );
         }
 
         for index in [4, 0, 7, 2, 5, 1, 6, 3] {
             assert!(matches!(
-                effect.on_exact_release(modifiers, ModifierProducerSource::Combo(index)),
+                effect.on_exact_release(modifiers, StickyKeySource::Combo(index)),
                 ModifierProducerRelease::Released {
                     removed: ModifierProducer {
-                        source: ModifierProducerSource::Combo(removed_index),
+                        source: StickyKeySource::Combo(removed_index),
                         modifiers: removed_modifiers,
                     },
                     ..
@@ -1452,7 +1468,7 @@ mod tests {
         for combo_sources in [false, true] {
             let source = |index: usize| {
                 if combo_sources {
-                    ModifierProducerSource::Combo(index as u16)
+                    StickyKeySource::Combo(index as u16)
                 } else {
                     direct(index as u8)
                 }
@@ -1486,11 +1502,11 @@ mod tests {
     fn direct_and_combo_identity_use_the_same_release_transition() {
         let modifiers = ModifierCombination::LCTRL;
         let mut direct_effect = StickyModifierEffect::new(modifiers, direct(0));
-        let mut combo_effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(3));
+        let mut combo_effect = StickyModifierEffect::new(modifiers, StickyKeySource::Combo(3));
 
         for release in [
             direct_effect.on_exact_release(modifiers, direct(0)),
-            combo_effect.on_exact_release(modifiers, ModifierProducerSource::Combo(3)),
+            combo_effect.on_exact_release(modifiers, StickyKeySource::Combo(3)),
         ] {
             assert!(matches!(
                 release,
