@@ -30,7 +30,7 @@ use crate::keyboard::combo::Combo;
 use crate::keyboard::fork::ActiveFork;
 use crate::keyboard::held_buffer::{HeldBuffer, HeldKey, KeyState};
 use crate::keyboard::mouse::{MouseAction, MouseState};
-use crate::keyboard::sticky_key::{StickyKeySource, StickyKeyState};
+use crate::keyboard::sticky_key::{StickyKeyDispatch, StickyKeySource, StickyKeyState};
 use crate::keyboard_macros::MacroOperation;
 use crate::keymap::KeyMap;
 use crate::{COMBO_MAX_NUM, FORK_MAX_NUM, MACRO_SPACE_SIZE, boot};
@@ -153,7 +153,11 @@ impl CapsWordState {
     }
 }
 
-impl Runnable for Keyboard<'_> {
+impl<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool> Runnable
+    for Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>
+where
+    (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+{
     /// Main keyboard processing task, it receives input devices result, processes keys.
     /// The report is sent using `send_report`.
     async fn run(&mut self) -> ! {
@@ -209,7 +213,12 @@ impl Runnable for Keyboard<'_> {
     }
 }
 
-pub struct Keyboard<'a> {
+pub struct Keyboard<
+    'a,
+    const STICKY_MODIFIER: bool = true,
+    const STICKY_LAYER: bool = true,
+    const STICKY_TAP_KEY: bool = true,
+> {
     /// Keymap
     pub(crate) keymap: &'a KeyMap<'a>,
 
@@ -291,7 +300,9 @@ pub struct Keyboard<'a> {
     passkey_entry_state: crate::ble::passkey::PasskeyEntryState,
 }
 
-impl<'a> Keyboard<'a> {
+impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>
+    Keyboard<'a, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>
+{
     pub fn new(keymap: &'a KeyMap<'a>) -> Self {
         Keyboard {
             keymap,
@@ -349,7 +360,11 @@ impl<'a> Keyboard<'a> {
     /// Process the latest buffered key.
     ///
     /// The given holding key is a copy of the buffered key. Only tap-hold keys are considered now.
-    pub async fn process_buffered_key(&mut self, key: HeldKey) {
+    #[allow(private_bounds)]
+    pub async fn process_buffered_key(&mut self, key: HeldKey)
+    where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         debug!(
             "Processing buffered key: \nevent: {:?} state: {:?}",
             key.event, key.state
@@ -406,7 +421,11 @@ impl<'a> Keyboard<'a> {
     }
 
     /// Process key changes at (row, col)
-    pub async fn process_inner(&mut self, event: KeyboardEvent) {
+    #[allow(private_bounds)]
+    pub async fn process_inner(&mut self, event: KeyboardEvent)
+    where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         self.update_physical_key_count(event);
 
         // Claim press-triggered Sticky effects at the physical event, before a
@@ -463,7 +482,9 @@ impl<'a> Keyboard<'a> {
         event: KeyboardEvent,
         combo_index: Option<usize>,
         event_time: Instant,
-    ) {
+    ) where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         // First, make the decision for current key and held keys
         let (decision_for_current_key, decisions) = self.make_decisions_for_keys(key_action, event);
 
@@ -561,7 +582,10 @@ impl<'a> Keyboard<'a> {
         &mut self,
         mut decision_for_current_key: KeyBehaviorDecision,
         decisions: Vec<(KeyboardEventPos, HeldKeyDecision), 16>,
-    ) -> (bool, KeyBehaviorDecision) {
+    ) -> (bool, KeyBehaviorDecision)
+    where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         let mut keyboard_state_updated = false;
         // Fire buffered keys
         for (pos, decision) in decisions {
@@ -770,7 +794,10 @@ impl<'a> Keyboard<'a> {
     ) -> (
         KeyBehaviorDecision,
         Vec<(KeyboardEventPos, HeldKeyDecision), HOLD_BUFFER_SIZE>,
-    ) {
+    )
+    where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         // Decision of current key and held keys
         let mut decision_for_current_key = KeyBehaviorDecision::Ignore;
         let mut decisions: Vec<(_, HeldKeyDecision), HOLD_BUFFER_SIZE> = Vec::new();
@@ -917,7 +944,9 @@ impl<'a> Keyboard<'a> {
         event: KeyboardEvent,
         combo_index: Option<usize>,
         event_time: Instant,
-    ) {
+    ) where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         // Start forks
         let key_action = self.try_start_forks(original_key_action, event);
 
@@ -948,7 +977,9 @@ impl<'a> Keyboard<'a> {
         event: KeyboardEvent,
         combo_index: Option<usize>,
         event_time: Instant,
-    ) {
+    ) where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         match key_action {
             KeyAction::No | KeyAction::Transparent => self.sticky_key_state.finish_buffered_claim(),
             KeyAction::Single(action) => {
@@ -1119,7 +1150,10 @@ impl<'a> Keyboard<'a> {
     /// - `key_action`: The action of the key that triggered this function
     /// - `event`: The keyboard event. When pressing (interrupting), trigger any delayed combo.
     ///   When releasing, only trigger combos that contain the key_action.
-    async fn trigger_delayed_combo(&mut self, key_action: &KeyAction, event: KeyboardEvent) {
+    async fn trigger_delayed_combo(&mut self, key_action: &KeyAction, event: KeyboardEvent)
+    where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         // First, find the delayed combo and trigger it
         let triggered_combo = self.keymap.with_combos_mut(|combos| {
             combos
@@ -1189,7 +1223,10 @@ impl<'a> Keyboard<'a> {
         key_action: &KeyAction,
         event: KeyboardEvent,
         event_time: Instant,
-    ) -> (Option<KeyAction>, Option<usize>) {
+    ) -> (Option<KeyAction>, Option<usize>)
+    where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         let current_layer = self.keymap.get_activated_layer();
 
         // First, when releasing a key, check whether there's untriggered combo, if so, triggerer it first
@@ -1335,7 +1372,10 @@ impl<'a> Keyboard<'a> {
     }
 
     // Dispatch combo keys buffered in the held buffer when the combo isn't being triggered.
-    async fn dispatch_combos(&mut self, key_action: &KeyAction, event: KeyboardEvent) {
+    async fn dispatch_combos(&mut self, key_action: &KeyAction, event: KeyboardEvent)
+    where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         self.trigger_delayed_combo(key_action, event).await;
 
         // Dispatch all keys with state `WaitingCombo` in the held buffer

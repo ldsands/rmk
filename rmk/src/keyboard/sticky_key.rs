@@ -4,6 +4,8 @@
 //! confined to applying and releasing the effect; modifier and layer entries
 //! may coexist, while a modified tap key remains deliberately exclusive.
 
+use core::future::Future;
+
 use embassy_time::{Duration, Instant};
 use rmk_types::action::Action;
 use rmk_types::keycode::{HidKeyCode, KeyCode};
@@ -128,7 +130,10 @@ impl StickyEntry {
     ) -> ModifierProducerInsert {
         let inserted = self.modifier_effect_mut().begin_press(modifiers, source);
         if inserted == ModifierProducerInsert::Added {
-            self.sync_modifier_action();
+            let Action::Modifier(current) = self.action else {
+                unreachable!("modifier entry must contain a modifier action");
+            };
+            self.action = Action::Modifier(current | modifiers);
         }
         inserted
     }
@@ -138,27 +143,24 @@ impl StickyEntry {
         modifiers: ModifierCombination,
         source: StickyKeySource,
     ) -> ModifierProducerRelease {
-        let release = self.modifier_effect_mut().on_exact_release(modifiers, source);
-        if matches!(release, ModifierProducerRelease::Released { .. }) {
-            self.sync_modifier_action();
+        let Action::Modifier(old_effective) = self.action else {
+            unreachable!("modifier entry must contain a modifier action");
+        };
+        let release = self
+            .modifier_effect_mut()
+            .on_exact_release(modifiers, source, old_effective);
+        if let ModifierProducerRelease::Released { new_effective, .. } = release {
+            self.action = Action::Modifier(new_effective);
         }
         release
     }
 
     fn retain_modifier(&mut self, modifiers: ModifierCombination) {
         self.modifier_effect_mut().retain(modifiers);
-        self.sync_modifier_action();
-    }
-
-    fn sync_modifier_action(&mut self) {
-        self.action = Action::Modifier(self.modifier_effect().effective());
-    }
-
-    fn modifier_effect(&self) -> &StickyModifierEffect {
-        match &self.effect_state {
-            StickyEffectState::Modifier(effect) => effect,
-            StickyEffectState::ActionOnly(_) => unreachable!("modifier action must own modifier effect state"),
-        }
+        let Action::Modifier(current) = self.action else {
+            unreachable!("modifier entry must contain a modifier action");
+        };
+        self.action = Action::Modifier(current | modifiers);
     }
 
     fn modifier_effect_mut(&mut self) -> &mut StickyModifierEffect {
@@ -409,8 +411,7 @@ impl StickyModifierEffect {
             .fold(self.retained, |modifiers, producer| modifiers | producer.modifiers)
     }
 
-    fn release_at(&mut self, index: usize) -> ModifierProducerRelease {
-        let old_effective = self.effective();
+    fn release_at(&mut self, index: usize, old_effective: ModifierCombination) -> ModifierProducerRelease {
         let removed = self.producers[index]
             .take()
             .expect("release index must contain a modifier producer");
@@ -423,12 +424,19 @@ impl StickyModifierEffect {
         }
     }
 
-    fn on_exact_release(&mut self, modifiers: ModifierCombination, source: StickyKeySource) -> ModifierProducerRelease {
+    // `StickyEntry::action` caches `old_effective` so the release path does not
+    // scan the fixed producer table twice.
+    fn on_exact_release(
+        &mut self,
+        modifiers: ModifierCombination,
+        source: StickyKeySource,
+        old_effective: ModifierCombination,
+    ) -> ModifierProducerRelease {
         let exact = ModifierProducer { source, modifiers };
         let Some(index) = self.producers.iter().position(|producer| *producer == Some(exact)) else {
             return ModifierProducerRelease::Unmatched;
         };
-        self.release_at(index)
+        self.release_at(index, old_effective)
     }
 }
 
@@ -526,7 +534,209 @@ impl StickyKeyState {
     }
 }
 
-impl Keyboard<'_> {
+// Return each selected handler future directly. A const branch inside the
+// shared async dispatcher leaves all three handler futures in its state
+// machine, while an extra async wrapper increases the executor task size.
+trait ModifierStickyDispatch<const ENABLED: bool> {
+    fn dispatch_modifier<const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>(
+        keyboard: &mut Keyboard<'_, ENABLED, STICKY_LAYER, STICKY_TAP_KEY>,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()>;
+}
+
+impl ModifierStickyDispatch<true> for () {
+    fn dispatch_modifier<const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>(
+        keyboard: &mut Keyboard<'_, true, STICKY_LAYER, STICKY_TAP_KEY>,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        let policy = keyboard.keymap.sticky_key_profile(profile, StickyKeyShape::PureMod);
+        keyboard.process_modifier_effect(modifiers, policy, event, event_time, source)
+    }
+}
+
+impl ModifierStickyDispatch<false> for () {
+    fn dispatch_modifier<const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>(
+        _keyboard: &mut Keyboard<'_, false, STICKY_LAYER, STICKY_TAP_KEY>,
+        _modifiers: ModifierCombination,
+        _profile: u8,
+        _event: KeyboardEvent,
+        _event_time: Instant,
+        _source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        async { warn!("Sticky modifier omitted from this static firmware") }
+    }
+}
+
+trait LayerStickyDispatch<const ENABLED: bool> {
+    fn dispatch_layer<const STICKY_MODIFIER: bool, const STICKY_TAP_KEY: bool>(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, ENABLED, STICKY_TAP_KEY>,
+        layer: u8,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()>;
+}
+
+impl LayerStickyDispatch<true> for () {
+    fn dispatch_layer<const STICKY_MODIFIER: bool, const STICKY_TAP_KEY: bool>(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, true, STICKY_TAP_KEY>,
+        layer: u8,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        let policy = keyboard.keymap.sticky_key_profile(profile, StickyKeyShape::Layer);
+        keyboard.process_layer_effect(layer, policy, event, event_time, source)
+    }
+}
+
+impl LayerStickyDispatch<false> for () {
+    fn dispatch_layer<const STICKY_MODIFIER: bool, const STICKY_TAP_KEY: bool>(
+        _keyboard: &mut Keyboard<'_, STICKY_MODIFIER, false, STICKY_TAP_KEY>,
+        _layer: u8,
+        _profile: u8,
+        _event: KeyboardEvent,
+        _event_time: Instant,
+        _source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        async { warn!("Sticky layer omitted from this static firmware") }
+    }
+}
+
+trait TapKeyStickyDispatch<const ENABLED: bool> {
+    fn dispatch_tap_key<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool>(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, ENABLED>,
+        key: HidKeyCode,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()>;
+}
+
+impl TapKeyStickyDispatch<true> for () {
+    fn dispatch_tap_key<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool>(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, true>,
+        key: HidKeyCode,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        let policy = keyboard.keymap.sticky_key_profile(profile, StickyKeyShape::TapKey);
+        keyboard.process_tap_key_effect(key, modifiers, policy, event, event_time, source)
+    }
+}
+
+impl TapKeyStickyDispatch<false> for () {
+    fn dispatch_tap_key<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool>(
+        _keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, false>,
+        _key: HidKeyCode,
+        _modifiers: ModifierCombination,
+        _profile: u8,
+        _event: KeyboardEvent,
+        _event_time: Instant,
+        _source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        async { warn!("Sticky tap key omitted from this static firmware") }
+    }
+}
+
+/// One internal dispatch bound for the three independently selected shapes.
+/// The blanket implementation keeps the public `Keyboard` type usable with
+/// default consts while concrete generated builds still monomorphize each
+/// effect call independently.
+pub(crate) trait StickyKeyDispatch<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool> {
+    fn modifier(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()>;
+
+    fn layer(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+        layer: u8,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()>;
+
+    fn tap_key(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+        key: HidKeyCode,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()>;
+}
+
+impl<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>
+    StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY> for ()
+where
+    (): ModifierStickyDispatch<STICKY_MODIFIER>,
+    (): LayerStickyDispatch<STICKY_LAYER>,
+    (): TapKeyStickyDispatch<STICKY_TAP_KEY>,
+{
+    fn modifier(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        <() as ModifierStickyDispatch<STICKY_MODIFIER>>::dispatch_modifier(
+            keyboard, modifiers, profile, event, event_time, source,
+        )
+    }
+
+    fn layer(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+        layer: u8,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        <() as LayerStickyDispatch<STICKY_LAYER>>::dispatch_layer(keyboard, layer, profile, event, event_time, source)
+    }
+
+    fn tap_key(
+        keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+        key: HidKeyCode,
+        modifiers: ModifierCombination,
+        profile: u8,
+        event: KeyboardEvent,
+        event_time: Instant,
+        source: StickyKeySource,
+    ) -> impl Future<Output = ()> {
+        <() as TapKeyStickyDispatch<STICKY_TAP_KEY>>::dispatch_tap_key(
+            keyboard, key, modifiers, profile, event, event_time, source,
+        )
+    }
+}
+
+impl<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>
+    Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>
+{
     pub(crate) async fn process_action_sticky_key(
         &mut self,
         action: Action,
@@ -534,37 +744,41 @@ impl Keyboard<'_> {
         event: KeyboardEvent,
         event_time: Instant,
         source: StickyKeySource,
-    ) {
-        let shape = match action {
-            Action::Modifier(_) => StickyKeyShape::PureMod,
-            Action::LayerOn(_) => StickyKeyShape::Layer,
-            Action::KeyWithModifier(_, _) => StickyKeyShape::TapKey,
-            _ => {
-                warn!("Unsupported Sticky Key action: {:?}", action);
-                return;
-            }
-        };
-        let policy = self.keymap.sticky_key_profile(profile, shape);
-
+    ) where
+        (): StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>,
+    {
         // The action match is the narrow effect boundary. All variants store
         // and advance the same `StickyEntry` lifecycle.
         match action {
             Action::Modifier(modifiers) => {
-                self.process_modifier_effect(modifiers, policy, event, event_time, source)
-                    .await
+                <() as StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>>::modifier(
+                    self, modifiers, profile, event, event_time, source,
+                )
+                .await
             }
             Action::LayerOn(layer) => {
-                self.process_layer_effect(layer, policy, event, event_time, source)
-                    .await
+                <() as StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>>::layer(
+                    self, layer, profile, event, event_time, source,
+                )
+                .await
             }
             Action::KeyWithModifier(key, modifiers) => {
-                self.process_tap_key_effect(key, modifiers, policy, event, event_time, source)
-                    .await
+                <() as StickyKeyDispatch<STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>>::tap_key(
+                    self, key, modifiers, profile, event, event_time, source,
+                )
+                .await
             }
-            _ => unreachable!("unsupported Sticky Key action rejected above"),
+            _ => warn!("Unsupported Sticky Key action: {:?}", action),
         }
     }
+}
 
+impl<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>
+    Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>
+{
+    // Keeping each effect future separate saves 128 bytes on the minimum
+    // STM32F1 firmware by avoiding one merged async state machine.
+    #[inline(never)]
     async fn process_modifier_effect(
         &mut self,
         modifiers: ModifierCombination,
@@ -677,6 +891,7 @@ impl Keyboard<'_> {
         true
     }
 
+    #[inline(never)]
     async fn process_layer_effect(
         &mut self,
         layer: u8,
@@ -739,6 +954,7 @@ impl Keyboard<'_> {
         }
     }
 
+    #[inline(never)]
     async fn process_tap_key_effect(
         &mut self,
         key: HidKeyCode,
@@ -975,12 +1191,38 @@ impl Keyboard<'_> {
 mod tests {
     use super::*;
 
+    fn assert_dispatch_set<const MODIFIER: bool, const LAYER: bool, const TAP_KEY: bool>()
+    where
+        (): StickyKeyDispatch<MODIFIER, LAYER, TAP_KEY>,
+    {
+    }
+
+    #[test]
+    fn every_sticky_shape_set_has_static_dispatch() {
+        assert_dispatch_set::<false, false, false>();
+        assert_dispatch_set::<false, false, true>();
+        assert_dispatch_set::<false, true, false>();
+        assert_dispatch_set::<false, true, true>();
+        assert_dispatch_set::<true, false, false>();
+        assert_dispatch_set::<true, false, true>();
+        assert_dispatch_set::<true, true, false>();
+        assert_dispatch_set::<true, true, true>();
+    }
+
     fn pos(col: u8) -> KeyboardEventPos {
         KeyboardEventPos::key_pos(col, 0)
     }
 
     fn direct(col: u8) -> StickyKeySource {
         StickyKeySource::Direct(pos(col))
+    }
+
+    fn release_producer(
+        effect: &mut StickyModifierEffect,
+        modifiers: ModifierCombination,
+        source: StickyKeySource,
+    ) -> ModifierProducerRelease {
+        effect.on_exact_release(modifiers, source, effect.effective())
     }
 
     fn policy(release_mode: StickyKeyReleaseMode) -> StickyKeyPolicy {
@@ -1375,18 +1617,18 @@ mod tests {
         let mut direct_effect = StickyModifierEffect::new(modifiers, direct(1));
 
         assert_eq!(
-            direct_effect.on_exact_release(modifiers, StickyKeySource::Combo(0)),
+            release_producer(&mut direct_effect, modifiers, StickyKeySource::Combo(0)),
             ModifierProducerRelease::Unmatched
         );
         assert_eq!(direct_effect.effective(), modifiers);
 
         let mut combo_effect = StickyModifierEffect::new(modifiers, StickyKeySource::Combo(1));
         assert_eq!(
-            combo_effect.on_exact_release(modifiers, direct(0)),
+            release_producer(&mut combo_effect, modifiers, direct(0)),
             ModifierProducerRelease::Unmatched
         );
         assert_eq!(
-            combo_effect.on_exact_release(modifiers, StickyKeySource::Combo(0)),
+            release_producer(&mut combo_effect, modifiers, StickyKeySource::Combo(0)),
             ModifierProducerRelease::Unmatched
         );
         assert_eq!(combo_effect.effective(), modifiers);
@@ -1402,7 +1644,7 @@ mod tests {
         );
 
         assert!(matches!(
-            effect.on_exact_release(modifiers, StickyKeySource::Combo(0)),
+            release_producer(&mut effect, modifiers, StickyKeySource::Combo(0)),
             ModifierProducerRelease::Released {
                 removed: ModifierProducer {
                     source: StickyKeySource::Combo(0),
@@ -1413,7 +1655,7 @@ mod tests {
             } if removed_modifiers == modifiers
         ));
         assert!(matches!(
-            effect.on_exact_release(modifiers, StickyKeySource::Combo(3)),
+            release_producer(&mut effect, modifiers, StickyKeySource::Combo(3)),
             ModifierProducerRelease::Released {
                 removed: ModifierProducer {
                     source: StickyKeySource::Combo(3),
@@ -1438,7 +1680,7 @@ mod tests {
 
         for index in [4, 0, 7, 2, 5, 1, 6, 3] {
             assert!(matches!(
-                effect.on_exact_release(modifiers, StickyKeySource::Combo(index)),
+                release_producer(&mut effect, modifiers, StickyKeySource::Combo(index)),
                 ModifierProducerRelease::Released {
                     removed: ModifierProducer {
                         source: StickyKeySource::Combo(removed_index),
@@ -1497,7 +1739,7 @@ mod tests {
 
             for index in (MAX_STICKY_MODIFIER_PRODUCERS..(MAX_STICKY_MODIFIER_PRODUCERS * 3)).rev() {
                 assert_eq!(
-                    effect.on_exact_release(modifiers, source(index)),
+                    release_producer(&mut effect, modifiers, source(index)),
                     ModifierProducerRelease::Unmatched
                 );
             }
@@ -1513,8 +1755,8 @@ mod tests {
         let mut combo_effect = StickyModifierEffect::new(modifiers, StickyKeySource::Combo(3));
 
         for release in [
-            direct_effect.on_exact_release(modifiers, direct(0)),
-            combo_effect.on_exact_release(modifiers, StickyKeySource::Combo(3)),
+            release_producer(&mut direct_effect, modifiers, direct(0)),
+            release_producer(&mut combo_effect, modifiers, StickyKeySource::Combo(3)),
         ] {
             assert!(matches!(
                 release,
@@ -1534,7 +1776,7 @@ mod tests {
         effect.begin_press(ModifierCombination::LCTRL | ModifierCombination::LSHIFT, direct(1));
 
         assert!(matches!(
-            effect.on_exact_release(ModifierCombination::LCTRL, direct(0)),
+            release_producer(&mut effect, ModifierCombination::LCTRL, direct(0)),
             ModifierProducerRelease::Released {
                 old_effective,
                 new_effective,
@@ -1555,7 +1797,7 @@ mod tests {
             ModifierCombination::LCTRL | ModifierCombination::LSHIFT
         );
         assert!(matches!(
-            effect.on_exact_release(ModifierCombination::LSHIFT, direct(1)),
+            release_producer(&mut effect, ModifierCombination::LSHIFT, direct(1)),
             ModifierProducerRelease::Released {
                 old_effective,
                 new_effective,

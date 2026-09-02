@@ -6,6 +6,7 @@ use rmk_config::resolved::hardware::{
 };
 use rmk_config::resolved::{Behavior, Hardware, Host, Identity, Keymap, Layout};
 
+use super::action_parser::{StickyKeyShapes, parse_key_with_shapes};
 use super::behavior::expand_behavior_config;
 use super::chip::bind_interrupt::expand_bind_interrupt;
 use super::chip::ble::expand_ble_config;
@@ -65,6 +66,20 @@ pub(crate) fn parse_keyboard_mod(item_mod: syn::ItemMod) -> TokenStream2 {
     )
     .unwrap_or_else(|err| panic!("{err}"));
 
+    let has_custom_entry = item_mod.content.as_ref().is_some_and(|(_, items)| {
+        items.iter().any(|item| {
+            let syn::Item::Fn(item_fn) = item else {
+                return false;
+            };
+            matches!(
+                crate::codegen::override_helper::find_overwritten(item_fn),
+                Some(Ok(crate::codegen::override_helper::Overwritten::Entry))
+            )
+        })
+    });
+    let sticky_key_shapes =
+        infer_sticky_key_shapes(&keymap, &behavior, &rmk_features, has_custom_entry);
+
     // Generate imports and statics
     let imports_and_statics =
         expand_imports_and_constants(&identity, &host, &hardware, &behavior, &keymap);
@@ -78,6 +93,7 @@ pub(crate) fn parse_keyboard_mod(item_mod: syn::ItemMod) -> TokenStream2 {
         &layout,
         item_mod,
         &rmk_features,
+        sticky_key_shapes,
     );
 
     quote! {
@@ -85,6 +101,68 @@ pub(crate) fn parse_keyboard_mod(item_mod: syn::ItemMod) -> TokenStream2 {
 
         #main_function
     }
+}
+
+/// Determine which Sticky effect handlers a generated, immutable keyboard can
+/// reach. Manual entry points and mutable keymaps keep every handler.
+fn infer_sticky_key_shapes(
+    keymap: &Keymap,
+    behavior: &Behavior,
+    rmk_features: &Option<Vec<String>>,
+    has_custom_entry: bool,
+) -> StickyKeyShapes {
+    if has_custom_entry
+        || rmk_features.is_none()
+        || ["vial", "rynk", "storage"]
+            .iter()
+            .any(|feature| is_feature_enabled(rmk_features, feature))
+    {
+        return StickyKeyShapes::ALL;
+    }
+
+    let profiles = behavior
+        .morse
+        .as_ref()
+        .map(|morse| morse.profiles.clone())
+        .filter(|profiles| !profiles.is_empty());
+    let sticky_profiles = behavior
+        .sticky_key
+        .as_ref()
+        .map(|sticky| sticky.profiles.clone())
+        .filter(|profiles| !profiles.is_empty());
+    let mut shapes = StickyKeyShapes::default();
+    let mut include = |action: &str| {
+        shapes.include(
+            parse_key_with_shapes(action.to_string(), &profiles, &sticky_profiles).sticky_shapes,
+        );
+    };
+
+    for action in keymap.keymap.iter().flatten().flatten() {
+        include(action);
+    }
+    for [clockwise, counter_clockwise] in keymap.encoder_map.iter().flatten() {
+        include(clockwise);
+        include(counter_clockwise);
+    }
+    if let Some(combos) = &behavior.combos {
+        for combo in &combos.combos {
+            for trigger in &combo.actions {
+                include(trigger);
+            }
+            include(&combo.output);
+        }
+    }
+    if let Some(forks) = &behavior.forks {
+        for fork in &forks.forks {
+            include(&fork.trigger);
+            include(&fork.negative_output);
+            include(&fork.positive_output);
+        }
+    }
+
+    // Morse maps store Action, not KeyAction. Their code generation calls
+    // KeyAction::to_action(), so a Sticky wrapper cannot reach the dispatcher.
+    shapes
 }
 
 fn validate_feature_config_parity(
@@ -183,11 +261,176 @@ pub(crate) fn expand_imports_and_constants(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_feature_config_parity;
+    use std::collections::HashMap;
+
+    use rmk_config::resolved::behavior::{
+        Combo, Combos, Fork, Forks, Morse, MorseKey, MorseProfile,
+    };
+
+    use super::{
+        Behavior, Keymap, StickyKeyShapes, infer_sticky_key_shapes, validate_feature_config_parity,
+    };
 
     /// Build the enabled-Cargo-features list that `validate_feature_config_parity` reads.
     fn features(enabled: &[&str]) -> Option<Vec<String>> {
         Some(enabled.iter().map(|f| f.to_string()).collect())
+    }
+
+    fn keymap(matrix_action: &str, encoder_actions: Option<[&str; 2]>) -> Keymap {
+        Keymap {
+            rows: 1,
+            cols: 1,
+            layers: 1,
+            keymap: vec![vec![vec![matrix_action.to_string()]]],
+            encoder_map: encoder_actions
+                .map(|[clockwise, counter_clockwise]| {
+                    vec![vec![[clockwise.to_string(), counter_clockwise.to_string()]]]
+                })
+                .unwrap_or_default(),
+            key_info: vec![vec![Default::default()]],
+            num_encoder: usize::from(encoder_actions.is_some()),
+        }
+    }
+
+    fn behavior(combos: Vec<Combo>, forks: Vec<Fork>) -> Behavior {
+        Behavior {
+            tri_layer: None,
+            one_shot_timeout_ms: None,
+            one_shot_modifiers: None,
+            combos: (!combos.is_empty()).then_some(Combos {
+                combos,
+                timeout_ms: None,
+                prior_idle_time_ms: None,
+            }),
+            macros: None,
+            forks: (!forks.is_empty()).then_some(Forks { forks }),
+            morse: None,
+            sticky_key: None,
+            auto_mouse_layer: Vec::new(),
+        }
+    }
+
+    fn infer(keymap: &Keymap, behavior: &Behavior) -> StickyKeyShapes {
+        infer_sticky_key_shapes(keymap, behavior, &features(&[]), false)
+    }
+
+    #[test]
+    fn infers_shapes_from_every_key_action_container() {
+        let combo = Combo {
+            actions: vec!["SK(Tab, [])".to_string(), "A".to_string()],
+            output: "OSM(LShift)".to_string(),
+            layer: None,
+        };
+        let fork = Fork {
+            trigger: "OSL(1)".to_string(),
+            negative_output: "SK(Tab, [LAlt])".to_string(),
+            positive_output: "OSM(LCtrl)".to_string(),
+            match_any: Some("Shift".to_string()),
+            match_none: None,
+            kept_modifiers: None,
+            bindable: false,
+        };
+        let all = infer(
+            &keymap("OSM(LGui)", Some(["OSL(1)", "SK(Tab, [])"])),
+            &behavior(vec![combo], vec![fork]),
+        );
+
+        assert_eq!(all, StickyKeyShapes::ALL);
+    }
+
+    #[test]
+    fn combo_and_fork_inputs_and_outputs_each_contribute() {
+        let cases = [
+            behavior(
+                vec![Combo {
+                    actions: vec!["OSM(LShift)".to_string()],
+                    output: "A".to_string(),
+                    layer: None,
+                }],
+                vec![],
+            ),
+            behavior(
+                vec![Combo {
+                    actions: vec!["A".to_string()],
+                    output: "OSL(1)".to_string(),
+                    layer: None,
+                }],
+                vec![],
+            ),
+            behavior(
+                vec![],
+                vec![Fork {
+                    trigger: "OSM(LShift)".to_string(),
+                    negative_output: "OSL(1)".to_string(),
+                    positive_output: "SK(Tab, [])".to_string(),
+                    match_any: Some("Shift".to_string()),
+                    match_none: None,
+                    kept_modifiers: None,
+                    bindable: false,
+                }],
+            ),
+        ];
+
+        assert!(infer(&keymap("A", None), &cases[0]).modifier);
+        assert!(infer(&keymap("A", None), &cases[1]).layer);
+        assert_eq!(infer(&keymap("A", None), &cases[2]), StickyKeyShapes::ALL);
+    }
+
+    #[test]
+    fn runtime_mutable_uncertain_and_custom_entries_force_all_shapes() {
+        let keymap = keymap("OSL(1)", None);
+        let behavior = behavior(vec![], vec![]);
+
+        for enabled in ["vial", "rynk", "storage"] {
+            assert_eq!(
+                infer_sticky_key_shapes(&keymap, &behavior, &features(&[enabled]), false),
+                StickyKeyShapes::ALL,
+                "{enabled}"
+            );
+        }
+        assert_eq!(
+            infer_sticky_key_shapes(&keymap, &behavior, &None, false),
+            StickyKeyShapes::ALL
+        );
+        assert_eq!(
+            infer_sticky_key_shapes(&keymap, &behavior, &features(&[]), true),
+            StickyKeyShapes::ALL
+        );
+    }
+
+    #[test]
+    fn morse_action_only_outputs_do_not_enable_sticky_dispatch() {
+        let mut behavior = behavior(vec![], vec![]);
+        behavior.morse = Some(Morse {
+            enable_flow_tap: false,
+            prior_idle_time_ms: 120,
+            default_profile: MorseProfile {
+                enable_flow_tap: None,
+                unilateral_tap: None,
+                permissive_hold: None,
+                hold_on_other_press: None,
+                normal_mode: None,
+                hold_timeout_ms: None,
+                gap_timeout_ms: None,
+                quick_tap_timeout_ms: None,
+            },
+            profiles: HashMap::new(),
+            morses: vec![MorseKey {
+                profile: None,
+                tap: Some("OSM(LShift)".to_string()),
+                hold: None,
+                hold_after_tap: None,
+                double_tap: None,
+                tap_actions: None,
+                hold_actions: None,
+                morse_actions: None,
+            }],
+        });
+
+        assert_eq!(
+            infer(&keymap("A", None), &behavior),
+            StickyKeyShapes::default()
+        );
     }
 
     #[test]
@@ -282,6 +525,7 @@ fn expand_main(
     layout: &Layout,
     item_mod: syn::ItemMod,
     rmk_features: &Option<Vec<String>>,
+    sticky_key_shapes: StickyKeyShapes,
 ) -> TokenStream2 {
     // Expand components of main function
     let imports = expand_custom_imports(&item_mod);
@@ -296,7 +540,7 @@ fn expand_main(
     let keymap_and_storage = expand_keymap_and_storage(hardware, keymap);
     let split_central_config = expand_split_central_config(hardware);
     let (input_device_config, devices, processors) = expand_input_device_config(hardware);
-    let matrix_and_keyboard = expand_matrix_and_keyboard_init(hardware);
+    let matrix_and_keyboard = expand_matrix_and_keyboard_init(hardware, sticky_key_shapes);
     let (registered_processor_initializers, mut registered_processors) =
         expand_registered_processor_init(hardware, &item_mod, rmk_features);
 
@@ -597,7 +841,10 @@ pub(crate) fn expand_keymap_and_storage(hardware: &Hardware, keymap: &Keymap) ->
     }
 }
 
-pub(crate) fn expand_matrix_and_keyboard_init(hardware: &Hardware) -> TokenStream2 {
+pub(crate) fn expand_matrix_and_keyboard_init(
+    hardware: &Hardware,
+    sticky_key_shapes: StickyKeyShapes,
+) -> TokenStream2 {
     let matrix = match &hardware.board {
         BoardConfig::UniBody(UniBodyConfig {
             matrix: matrix_config,
@@ -653,8 +900,18 @@ pub(crate) fn expand_matrix_and_keyboard_init(hardware: &Hardware) -> TokenStrea
             }
         }
     };
+    let modifier = sticky_key_shapes.modifier;
+    let layer = sticky_key_shapes.layer;
+    let tap_key = sticky_key_shapes.tap_key;
     quote! {
-        let mut keyboard = ::rmk::keyboard::Keyboard::new(&keymap);
+        const RMK_HAS_STICKY_MODIFIER: bool = #modifier;
+        const RMK_HAS_STICKY_LAYER: bool = #layer;
+        const RMK_HAS_STICKY_TAP_KEY: bool = #tap_key;
+        let mut keyboard = ::rmk::keyboard::Keyboard::<
+            RMK_HAS_STICKY_MODIFIER,
+            RMK_HAS_STICKY_LAYER,
+            RMK_HAS_STICKY_TAP_KEY,
+        >::new(&keymap);
         #matrix
     }
 }

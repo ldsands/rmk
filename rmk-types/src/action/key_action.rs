@@ -27,8 +27,9 @@ pub enum KeyAction {
     TapHold(Action, Action, u8),
     /// Morse action, references a morse configuration by index.
     Morse(u8),
-    /// Sticky activation of an action. The `u8` indexes the Sticky Key profile
-    /// table; `u8::MAX` selects the default profile.
+    /// Sticky activation of a modifier, layer-on, or key-with-modifier action.
+    /// The `u8` indexes the Sticky Key profile table; `u8::MAX` selects the
+    /// default profile. An unavailable index also falls back to the default.
     Sticky(Action, u8),
 }
 
