@@ -212,19 +212,23 @@ impl KeyboardTomlConfig {
             while let Some(offset) = current_keys[cursor..].find('@') {
                 let start = cursor + offset;
                 next.push_str(&current_keys[cursor..start]);
-                let mut end = start + 1;
-                while let Some(&byte) = current_keys.as_bytes().get(end) {
-                    if byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b',' | b'@') {
-                        break;
-                    }
-                    end += 1;
-                }
-                if end == start + 1 {
+                // The name ends at the grammar's delimiters, so `LM(1, @mods)`
+                // resolves `mods` — not a bogus `mods)`. Scan by `char` so a
+                // non-ASCII name never produces an invalid UTF-8 slice.
+                let alias_start = start + '@'.len_utf8();
+                let alias_len = current_keys[alias_start..]
+                    .char_indices()
+                    .find_map(|(offset, c)| (c.is_whitespace() || matches!(c, '(' | ')' | ',' | '@')).then_some(offset))
+                    .unwrap_or(current_keys.len() - alias_start);
+                let end = alias_start + alias_len;
+
+                let name = &current_keys[alias_start..end];
+                if name.is_empty() {
+                    // A bare `@` (trailing, or right before a delimiter) is literal.
                     next.push('@');
-                    cursor = end;
+                    cursor = alias_start;
                     continue;
                 }
-                let name = &current_keys[start + 1..end];
                 if Self::is_sticky_profile_reference(&current_keys, start) {
                     next.push_str(&current_keys[start..end]);
                 } else if let Some(value) = aliases.get(name) {
@@ -249,10 +253,10 @@ impl KeyboardTomlConfig {
     }
 
     fn is_sticky_profile_reference(input: &str, at: usize) -> bool {
-        let Some(previous) = input[..at].bytes().rev().find(|byte| !byte.is_ascii_whitespace()) else {
+        let Some(previous) = input[..at].chars().rev().find(|c| !c.is_whitespace()) else {
             return false;
         };
-        if previous != b',' {
+        if previous != ',' {
             return false;
         }
 
@@ -381,6 +385,81 @@ impl KeyboardTomlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unicode_alias_resolution() {
+        let aliases = HashMap::from([
+            ("ö".to_string(), "Kc0".to_string()),
+            ("ő".to_string(), "LeftBracket".to_string()),
+        ]);
+
+        assert_eq!(
+            KeyboardTomlConfig::alias_resolver("@ö @ő", &aliases),
+            Ok("Kc0 LeftBracket".to_string())
+        );
+    }
+
+    #[test]
+    fn test_unicode_alias_expands_action_and_recurses() {
+        let aliases = HashMap::from([
+            ("é".to_string(), "WM(Semicolon, RAlt)".to_string()),
+            ("magyar".to_string(), "@é".to_string()),
+        ]);
+        let layer_names = HashMap::new();
+
+        assert_eq!(
+            KeyboardTomlConfig::keymap_parser("@magyar", &aliases, &layer_names, 8),
+            Ok(vec!["WM(Semicolon, RAlt)".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_undefined_unicode_alias_returns_error() {
+        assert_eq!(
+            KeyboardTomlConfig::alias_resolver("不存在", &HashMap::new()),
+            Ok("不存在".to_string())
+        );
+        assert_eq!(
+            KeyboardTomlConfig::alias_resolver("@不存在", &HashMap::new()),
+            Err("Undefined alias: 不存在".to_string())
+        );
+    }
+
+    #[test]
+    fn test_unicode_whitespace_separates_aliases_and_actions() {
+        let aliases = HashMap::from([("ö".to_string(), "Kc0".to_string())]);
+        let layer_names = HashMap::new();
+
+        for separator in ['\u{00a0}', '\u{3000}'] {
+            let keymap = format!("@ö{separator}A");
+            assert_eq!(
+                KeyboardTomlConfig::keymap_parser(&keymap, &aliases, &layer_names, 8),
+                Ok(vec!["Kc0".to_string(), "A".to_string()]),
+                "separator U+{:04X}",
+                separator as u32
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_alias_resolution_preserves_sticky_profile_references() {
+        let aliases = HashMap::from([("ö".to_string(), "Kc0".to_string())]);
+
+        for action in [
+            "SK(LShift,\u{3000}@profile)",
+            "OSM(LShift,\u{3000}@profile)",
+            "OSL(1,\u{3000}@profile)",
+        ] {
+            assert_eq!(
+                KeyboardTomlConfig::alias_resolver(action, &aliases),
+                Ok(action.to_string())
+            );
+        }
+        assert_eq!(
+            KeyboardTomlConfig::alias_resolver("@ö", &aliases),
+            Ok("Kc0".to_string())
+        );
+    }
 
     #[test]
     fn test_no_action_parsing() {
