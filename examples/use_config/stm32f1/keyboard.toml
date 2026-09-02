@@ -64,6 +64,3 @@ defmt_log = false
 
 [host]
 vial_enabled = false
-
-[rmk]
-combo_max_num = 0
