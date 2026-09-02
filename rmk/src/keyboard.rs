@@ -409,6 +409,10 @@ impl<'a> Keyboard<'a> {
     pub async fn process_inner(&mut self, event: KeyboardEvent) {
         self.update_physical_key_count(event);
 
+        // Claim press-triggered Sticky effects at the physical event, before a
+        // combo or morse action can defer its eventual dispatch past timeout.
+        self.sticky_key_state.claim_buffered_press(event);
+
         // Check for mode transitions (e.g., entering/exiting passkey entry)
         #[cfg(feature = "passkey_entry")]
         self.passkey_entry_state.check_mode_transition();
@@ -460,10 +464,6 @@ impl<'a> Keyboard<'a> {
         combo_index: Option<usize>,
         event_time: Instant,
     ) {
-        // Claim press-triggered Sticky effects at the physical event, before a
-        // combo or morse action can defer its eventual dispatch past timeout.
-        self.sticky_key_state.claim_buffered_press(event);
-
         // First, make the decision for current key and held keys
         let (decision_for_current_key, decisions) = self.make_decisions_for_keys(key_action, event);
 

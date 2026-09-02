@@ -26,3 +26,17 @@ steps = [
   { tap = { pos = [0, 1], duration = 10 } },
 ]
 expect = [["LShift"], [], ["A"], []]
+
+# A physical press claims an armed Sticky Key before combo buffering can wait
+# past the Sticky timeout. When the incomplete combo eventually dispatches A,
+# the claimed modifier still applies to it.
+[[test]]
+name = "combo_candidate_claims_sticky_before_short_timeout"
+behavior.sticky_key = { activate_on_keypress = false, timeout = "50ms", release_mode = "other_key_press" }
+steps = [
+  { tap = { pos = [0, 0], duration = 10 } },
+  { press = [0, 1] },
+  { delay = 120 },
+  { release = [0, 1] },
+]
+expect = [["LShift", "A"], ["A"], []]
