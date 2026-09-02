@@ -323,6 +323,10 @@ enum DeadlineDisposition {
     Release,
 }
 
+/// Direct keys and combo outputs share this bound while they are physically
+/// held. Eight permits one producer per HID modifier while bounding each active
+/// Sticky entry on small MCUs. An overflow press and its later release are both
+/// ignored, so they cannot disturb the accepted producers.
 const MAX_STICKY_MODIFIER_PRODUCERS: usize = 8;
 const MAX_ACTIVE_STICKY_KEYS: usize = 2;
 

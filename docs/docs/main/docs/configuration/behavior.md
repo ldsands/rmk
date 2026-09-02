@@ -61,6 +61,8 @@ The legacy `[behavior.one_shot] timeout` and `[behavior.one_shot_modifiers]` set
 
 Sticky layers use RMK's normal boolean layer state: when multiple actions target the same layer, the latest activate or deactivate command determines its state.
 
+RMK tracks up to eight simultaneously held Sticky modifier producers. A directly pressed Sticky modifier and a combo that outputs one each use a slot, including producers with the same modifier mask. A press above this limit is ignored, as is its later release, so it cannot release any of the eight accepted producers. Releasing an accepted producer frees its slot.
+
 ## Combo
 
 In the `combo` sub-table, you can configure the keyboard's combo key functionality. Combo allows you to define a group of keys that, when pressed simultaneously, will trigger a specific output action.
