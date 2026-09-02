@@ -917,7 +917,7 @@ impl<'a> Keyboard<'a> {
         }
 
         let mut decision_state = StateBits {
-            // "explicit modifiers" includes the effect of one-shot modifiers, held modifiers keys only
+            // "explicit modifiers" includes Sticky Key modifiers and held modifier keys only
             modifiers: self.resolve_explicit_modifiers(event.pressed),
             leds: LedIndicator::from_bits(LOCK_LED_STATES.load(core::sync::atomic::Ordering::Relaxed)),
             mouse: MouseButtons::from_bits(self.mouse.report.buttons),
@@ -1405,7 +1405,7 @@ impl<'a> Keyboard<'a> {
                 self.process_action_layer_switch(layer_num, event).await;
                 self.send_keyboard_report_with_resolved_modifiers(event.pressed).await
             }
-            Action::Light(_light_action) => warn!("Light controll is not supported"),
+            Action::Light(_light_action) => warn!("Light control is not supported"),
             Action::KeyboardControl(c) => self.process_action_keyboard_control(c, event).await,
             Action::Special(special_key) => self.process_action_special(special_key, event).await,
             Action::User(id) => self.process_user(id, event).await,
@@ -1459,7 +1459,7 @@ impl<'a> Keyboard<'a> {
     /// - registered modifiers
     /// - Sticky Key modifiers
     pub fn resolve_explicit_modifiers(&self, pressed: bool) -> ModifierCombination {
-        // if a one-shot modifier is active, decorate the hid report of keypress with those modifiers
+        // If a Sticky Key modifier is active, add it to the keypress HID report.
         let mut result = self.held_modifiers;
         result |= self.sticky_key_state.modifiers(pressed);
 
@@ -1512,7 +1512,7 @@ impl<'a> Keyboard<'a> {
         result
     }
 
-    // Process a basic keypress/release and also take care of applying one shot modifiers
+    // Process a basic keypress/release and apply any active Sticky Key modifiers.
     async fn process_hid_keycode(&mut self, key: HidKeyCode, event: KeyboardEvent) {
         #[cfg(feature = "passkey_entry")]
         if self.passkey_entry_state.is_active() {
