@@ -74,16 +74,17 @@ expect = [
   [],
 ]
 
-# OSM released while the tap-hold key is still down: the tap still carries it.
+# Releasing OSM while a tap-hold key is physically down does not create a new
+# latch. The later tap therefore has no Sticky modifier.
 [[test]]
-name = "osm_rolling_with_tap_hold"
+name = "osm_live_release_while_tap_hold_is_down"
 steps = [
   { press = [0, 0] },    # Press OSM(LShift)
   { press = [0, 3] },    # Press TH(B, C)
   { release = [0, 0] },  # Release OSM(LShift)
   { release = [0, 3] },  # Release TH(B, C)
 ]
-expect = [["LShift", "B"], []]
+expect = [["B"], []]
 
 # Two OSMs stack onto the same next key.
 [[test]]
@@ -282,9 +283,9 @@ expect = [
 name = "osm_armed_does_not_stall_mouse_repeats"
 behavior.one_shot = { timeout = "600ms" }
 steps = [
-  { press = [0, 8] },   # Hold MouseWheelUp: initial delta, first repeat due at +100ms
   { press = [0, 0] },   # OSM(LShift) down
-  { release = [0, 0] }, # OSM(LShift) up and still armed; repeats must continue regardless
+  { release = [0, 0] }, # OSM(LShift) up and armed before another physical key is held
+  { press = [0, 8] },   # Hold MouseWheelUp: initial delta, first repeat due at +100ms
   { delay = 280 },      # covers the repeat ticks at +100/+180/+260ms
   { tap = { pos = [0, 2], duration = 10 } },  # Control: OSM is still armed while the mouse key is held
   { release = [0, 8] },
@@ -363,3 +364,109 @@ steps = [
   { tap = { pos = [0, 2], duration = 10 } },
 ]
 expect = [["LShift"], ["LShift", "LCtrl"], ["LShift", "LCtrl", "A"], ["A"], []]
+
+# Releasing one physically held OSM removes only that producer's modifier from
+# the current report. Other held modifiers and keys stay down.
+[[test]]
+name = "osm_live_release_ctrl_while_shift_and_key_remain"
+behavior.one_shot_modifiers = { activate_on_keypress = false }
+steps = [
+  { press = [0, 4] },
+  { press = [0, 0] },
+  { press = [0, 2] },
+  { release = [0, 4] },
+  { release = [0, 0] },
+  { release = [0, 2] },
+]
+expect = [
+  ["LShift", "LCtrl", "A"],
+  ["LShift", "A"],
+  ["A"],
+  [],
+]
+
+[[test]]
+name = "osm_live_release_shift_while_ctrl_and_key_remain"
+steps = [
+  { press = [0, 4] },
+  { press = [0, 0] },
+  { press = [0, 2] },
+  { release = [0, 0] },
+  { release = [0, 4] },
+  { release = [0, 2] },
+]
+expect = [
+  ["LShift", "LCtrl", "A"],
+  ["LCtrl", "A"],
+  ["A"],
+  [],
+]
+
+[[test]]
+name = "osm_live_release_after_target_keyup"
+steps = [
+  { press = [0, 4] },
+  { press = [0, 0] },
+  { press = [0, 2] },
+  { release = [0, 2] },
+  { release = [0, 4] },
+  { release = [0, 0] },
+]
+expect = [
+  ["LShift", "LCtrl", "A"],
+  ["LShift", "LCtrl"],
+  ["LShift"],
+  [],
+]
+
+[[test]]
+name = "osm_release_before_target_leaves_only_held_producer"
+steps = [
+  { press = [0, 4] },
+  { press = [0, 0] },
+  { release = [0, 4] },
+  { press = [0, 2] },
+  { release = [0, 2] },
+  { release = [0, 0] },
+]
+expect = [
+  ["LShift", "A"],
+  ["LShift"],
+  [],
+]
+
+[[test]]
+name = "osm_live_release_with_activate_on_keypress"
+behavior.one_shot_modifiers = { activate_on_keypress = true }
+steps = [
+  { press = [0, 4] },
+  { press = [0, 0] },
+  { press = [0, 2] },
+  { release = [0, 4] },
+  { release = [0, 0] },
+  { release = [0, 2] },
+]
+expect = [
+  ["LCtrl"],
+  ["LShift", "LCtrl"],
+  ["LShift", "LCtrl", "A"],
+  ["LShift", "A"],
+  ["A"],
+  [],
+]
+
+[[test]]
+name = "osm_release_while_mouse_key_is_down_does_not_latch"
+steps = [
+  { press = [0, 0] },
+  { press = [0, 8] },
+  { release = [0, 0] },
+  { release = [0, 8] },
+  { tap = { pos = [0, 2], duration = 10 } },
+]
+expect = [
+  { mouse = { wheel = -1 } },
+  { mouse = {} },
+  ["A"],
+  [],
+]

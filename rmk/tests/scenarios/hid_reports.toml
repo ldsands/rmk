@@ -24,7 +24,7 @@ keys = """
 AudioVolUp  SystemSleep  MouseRight  MO(1)
 No          No           No          No
 No          No           No          No
-SK(LShift)  A            No          No
+SK(LShift)  A            SHIFTED(B)  No
 """
 
 [[keymap.layer]]
@@ -144,3 +144,55 @@ steps = [
   { tap = { pos = [3, 1], duration = 10 } },
 ]
 expect = [["LShift"], { mouse = { x = 5 } }, { mouse = {} }, [], ["A"], []]
+
+[[test]]
+name = "live_sticky_release_balances_keyboard_page_while_consumer_stays_down"
+behavior.sticky_key = { activate_on_keypress = true, release_mode = "other_key_release" }
+steps = [
+  { press = [3, 0] },
+  { press = [0, 0] },
+  { release = [3, 0] },
+  { release = [0, 0] },
+]
+expect = [
+  ["LShift"],
+  { consumer = ["AudioVolUp"] },
+  [],
+  { consumer = [] },
+]
+
+[[test]]
+name = "live_sticky_release_balances_keyboard_page_while_system_key_stays_down"
+behavior.sticky_key = { activate_on_keypress = true, release_mode = "other_key_release" }
+steps = [
+  { press = [3, 0] },
+  { press = [0, 1] },
+  { release = [3, 0] },
+  { release = [0, 1] },
+]
+expect = [
+  ["LShift"],
+  { system = ["SystemSleep"] },
+  [],
+  { system = [] },
+]
+
+[[test]]
+name = "consumer_press_refreshes_sticky_ownership_after_clearing_key_with_modifier"
+behavior.sticky_key = { activate_on_keypress = true, release_mode = "other_key_release" }
+steps = [
+  { press = [3, 0] },
+  { press = [3, 2] },
+  { press = [0, 0] },
+  { release = [3, 0] },
+  { release = [0, 0] },
+  { release = [3, 2] },
+]
+expect = [
+  ["LShift"],
+  ["LShift", "B"],
+  { consumer = ["AudioVolUp"] },
+  ["B"],
+  { consumer = [] },
+  [],
+]

@@ -263,6 +263,17 @@ impl<'a> Keyboard<'a> {
         // Trigger all non morse keys in the buffer
         while let Some(key) = self.held_buffer.remove_if(|k| !k.action.is_morse()) {
             debug!("Trigger non-morse key: {:?}", key);
+            if let Some(combo_index) = key.sticky_modifier_combo_index {
+                self.prepare_key_action_dispatch(key.event);
+                self.process_non_morse_key_action_inner(
+                    key.action,
+                    key.event,
+                    Some(usize::from(combo_index)),
+                    key.press_time,
+                )
+                .await;
+                continue;
+            }
             let action = self.keymap.get_action_with_layer_cache(key.event);
             match action {
                 KeyAction::Single(action) => self.process_key_action_normal(action, key.event).await,

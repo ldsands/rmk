@@ -127,6 +127,9 @@ pub enum KeyState {
 pub struct HeldKey {
     pub event: KeyboardEvent,
     pub action: KeyAction,
+    /// Stable combo-table slot for a buffered combo-produced pure-modifier
+    /// Sticky action. No other buffered action stores combo provenance.
+    pub sticky_modifier_combo_index: Option<u16>,
     /// Current state of the held key
     pub state: KeyState,
     /// The press time for the key
@@ -146,9 +149,15 @@ impl HeldKey {
         Self {
             event,
             action,
+            sticky_modifier_combo_index: None,
             state,
             press_time,
             timeout_time,
         }
+    }
+
+    pub fn with_sticky_modifier_combo_index(mut self, combo_index: u16) -> Self {
+        self.sticky_modifier_combo_index = Some(combo_index);
+        self
     }
 }

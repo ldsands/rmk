@@ -61,6 +61,22 @@ enum PhysicalRelease {
 
 impl StickyEntry {
     fn new(action: Action, source: KeyboardEventPos, policy: StickyKeyPolicy, pressed_at: Instant) -> Self {
+        Self::new_with_modifier_source(
+            action,
+            source,
+            policy,
+            pressed_at,
+            ModifierProducerSource::Direct(source),
+        )
+    }
+
+    fn new_with_modifier_source(
+        action: Action,
+        source: KeyboardEventPos,
+        policy: StickyKeyPolicy,
+        pressed_at: Instant,
+        modifier_source: ModifierProducerSource,
+    ) -> Self {
         let (phase, timing_marker) = Self::press_state(policy, pressed_at, pressed_at);
         Self {
             action,
@@ -72,11 +88,21 @@ impl StickyEntry {
             buffered_claim: false,
             effect_state: match action {
                 Action::Modifier(modifiers) => {
-                    StickyEffectState::Modifier(StickyModifierEffect::new(modifiers, source))
+                    StickyEffectState::Modifier(StickyModifierEffect::new(modifiers, modifier_source))
                 }
                 _ => StickyEffectState::ActionOnly,
             },
         }
+    }
+
+    fn new_modifier(
+        modifiers: ModifierCombination,
+        source: KeyboardEventPos,
+        producer_source: ModifierProducerSource,
+        policy: StickyKeyPolicy,
+        pressed_at: Instant,
+    ) -> Self {
+        Self::new_with_modifier_source(Action::Modifier(modifiers), source, policy, pressed_at, producer_source)
     }
 
     fn is_modifier(&self) -> bool {
@@ -105,17 +131,37 @@ impl StickyEntry {
         }
     }
 
-    fn add_modifier_producer(&mut self, modifiers: ModifierCombination, source: KeyboardEventPos) {
-        self.action = Action::Modifier(self.modifiers() | modifiers);
-        self.modifier_effect_mut().begin_press(modifiers, source);
+    fn add_modifier_producer(
+        &mut self,
+        modifiers: ModifierCombination,
+        source: ModifierProducerSource,
+    ) -> ModifierProducerInsert {
+        let inserted = self.modifier_effect_mut().begin_press(modifiers, source);
+        if inserted == ModifierProducerInsert::Added {
+            self.sync_modifier_action();
+        }
+        inserted
     }
 
-    fn on_exact_modifier_release(&mut self, modifiers: ModifierCombination, source: KeyboardEventPos) -> Option<bool> {
-        self.modifier_effect_mut().on_exact_release(modifiers, source)
+    fn on_exact_modifier_release(
+        &mut self,
+        modifiers: ModifierCombination,
+        source: ModifierProducerSource,
+    ) -> ModifierProducerRelease {
+        let release = self.modifier_effect_mut().on_exact_release(modifiers, source);
+        if matches!(release, ModifierProducerRelease::Released { .. }) {
+            self.sync_modifier_action();
+        }
+        release
     }
 
-    fn on_combo_modifier_release(&mut self, modifiers: ModifierCombination) -> Option<bool> {
-        self.modifier_effect_mut().on_combo_release(modifiers)
+    fn retain_modifier(&mut self, modifiers: ModifierCombination) {
+        self.modifier_effect_mut().retain(modifiers);
+        self.sync_modifier_action();
+    }
+
+    fn sync_modifier_action(&mut self) {
+        self.action = Action::Modifier(self.modifier_effect().effective());
     }
 
     fn modifier_effect(&self) -> &StickyModifierEffect {
@@ -281,61 +327,110 @@ const MAX_ACTIVE_STICKY_KEYS: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct ModifierProducer {
-    source: KeyboardEventPos,
+    source: ModifierProducerSource,
     modifiers: ModifierCombination,
 }
 
-/// Physical ownership and host-report state for accumulated sticky modifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) enum ModifierProducerSource {
+    /// A physical key, matched by its matrix position.
+    Direct(KeyboardEventPos),
+    /// A combo output, matched by its stable slot in the combo table.
+    Combo(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModifierProducerInsert {
+    Added,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModifierProducerRelease {
+    Unmatched,
+    Released {
+        removed: ModifierProducer,
+        old_effective: ModifierCombination,
+        new_effective: ModifierCombination,
+        producers_remain: bool,
+    },
+}
+
+/// Physical and retained ownership for accumulated Sticky modifiers.
 ///
-/// Positions distinguish a canceled producer's late release from a newer
-/// latch. The modifier fallback supports combo outputs, whose release event can
-/// come from a different constituent position than their press event.
+/// Producer identities keep late or rejected releases from removing another
+/// owner with the same modifier mask. Combo slots provide a stable identity
+/// even when different constituent positions trigger press and release.
 #[derive(Clone, Copy, Debug)]
 struct StickyModifierEffect {
     producers: [Option<ModifierProducer>; MAX_STICKY_MODIFIER_PRODUCERS],
-    host_visible: bool,
+    retained: ModifierCombination,
 }
 
 impl StickyModifierEffect {
-    fn new(modifiers: ModifierCombination, source: KeyboardEventPos) -> Self {
-        let mut effect = Self {
-            producers: [None; MAX_STICKY_MODIFIER_PRODUCERS],
-            host_visible: false,
-        };
-        effect.begin_press(modifiers, source);
-        effect
+    fn new(modifiers: ModifierCombination, source: ModifierProducerSource) -> Self {
+        let mut producers = [None; MAX_STICKY_MODIFIER_PRODUCERS];
+        producers[0] = Some(ModifierProducer { source, modifiers });
+        Self {
+            producers,
+            retained: ModifierCombination::new(),
+        }
     }
 
-    fn begin_press(&mut self, modifiers: ModifierCombination, source: KeyboardEventPos) {
+    fn begin_press(
+        &mut self,
+        modifiers: ModifierCombination,
+        source: ModifierProducerSource,
+    ) -> ModifierProducerInsert {
         let producer = ModifierProducer { source, modifiers };
         if let Some(slot) = self.producers.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(producer);
+            ModifierProducerInsert::Added
         } else {
             warn!(
                 "Too many simultaneous Sticky modifier producers; ignoring {:?}",
                 producer
             );
+            ModifierProducerInsert::Full
         }
     }
 
-    fn release_at(&mut self, index: usize) -> bool {
-        self.producers[index] = None;
-        self.producers.iter().all(Option::is_none)
+    fn retain(&mut self, modifiers: ModifierCombination) {
+        self.retained |= modifiers;
     }
 
-    fn on_exact_release(&mut self, modifiers: ModifierCombination, source: KeyboardEventPos) -> Option<bool> {
+    fn effective(&self) -> ModifierCombination {
+        self.producers
+            .iter()
+            .flatten()
+            .fold(self.retained, |modifiers, producer| modifiers | producer.modifiers)
+    }
+
+    fn release_at(&mut self, index: usize) -> ModifierProducerRelease {
+        let old_effective = self.effective();
+        let removed = self.producers[index]
+            .take()
+            .expect("release index must contain a modifier producer");
+        let new_effective = self.effective();
+        ModifierProducerRelease::Released {
+            removed,
+            old_effective,
+            new_effective,
+            producers_remain: self.producers.iter().any(Option::is_some),
+        }
+    }
+
+    fn on_exact_release(
+        &mut self,
+        modifiers: ModifierCombination,
+        source: ModifierProducerSource,
+    ) -> ModifierProducerRelease {
         let exact = ModifierProducer { source, modifiers };
-        self.producers
-            .iter()
-            .position(|producer| *producer == Some(exact))
-            .map(|index| self.release_at(index))
-    }
-
-    fn on_combo_release(&mut self, modifiers: ModifierCombination) -> Option<bool> {
-        self.producers
-            .iter()
-            .position(|producer| producer.is_some_and(|producer| producer.modifiers == modifiers))
-            .map(|index| self.release_at(index))
+        let Some(index) = self.producers.iter().position(|producer| *producer == Some(exact)) else {
+            return ModifierProducerRelease::Unmatched;
+        };
+        self.release_at(index)
     }
 }
 
@@ -343,14 +438,13 @@ impl StickyModifierEffect {
 enum StickyEffectState {
     /// Layer and tap-key effects are represented completely by `StickyEntry::action`.
     ActionOnly,
-    /// Modifier effects additionally track physical producers and host visibility.
+    /// Modifier effects additionally track physical and retained ownership.
     Modifier(StickyModifierEffect),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct StickyKeyUpdate {
     modifier_consumed: bool,
-    modifier_was_host_visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,7 +461,6 @@ pub(crate) enum StickyKeyPostAction {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StickyKeyState {
     active: [Option<StickyEntry>; MAX_ACTIVE_STICKY_KEYS],
-    canceled_modifier_releases: [Option<ModifierProducer>; MAX_STICKY_MODIFIER_PRODUCERS],
 }
 
 impl StickyKeyState {
@@ -395,43 +488,6 @@ impl StickyKeyState {
         };
         self.active[index] = Some(entry);
         Ok(index)
-    }
-
-    fn remember_canceled_modifier_release(&mut self, producer: ModifierProducer) {
-        if let Some(slot) = self.canceled_modifier_releases.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(producer);
-        } else {
-            warn!("Too many canceled Sticky modifier releases; dropping {:?}", producer);
-        }
-    }
-
-    fn consume_exact_canceled_modifier_release(
-        &mut self,
-        modifiers: ModifierCombination,
-        source: KeyboardEventPos,
-    ) -> bool {
-        let exact = ModifierProducer { source, modifiers };
-        let Some(index) = self
-            .canceled_modifier_releases
-            .iter()
-            .position(|producer| *producer == Some(exact))
-        else {
-            return false;
-        };
-        self.canceled_modifier_releases[index] = None;
-        true
-    }
-
-    fn consume_canceled_combo_release(&mut self, modifiers: ModifierCombination) -> bool {
-        let Some(index) = self
-            .canceled_modifier_releases
-            .iter()
-            .position(|producer| producer.is_some_and(|producer| producer.modifiers == modifiers))
-        else {
-            return false;
-        };
-        self.canceled_modifier_releases[index] = None;
-        true
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -470,14 +526,6 @@ impl StickyKeyState {
         }
         modifiers
     }
-
-    fn mark_modifier_host_visible(&mut self) {
-        if let Some(index) = self.modifier_index()
-            && let Some(entry) = self.active[index].as_mut()
-        {
-            entry.modifier_effect_mut().host_visible = true;
-        }
-    }
 }
 
 impl Keyboard<'_> {
@@ -487,6 +535,7 @@ impl Keyboard<'_> {
         profile: u8,
         event: KeyboardEvent,
         event_time: Instant,
+        modifier_source: ModifierProducerSource,
     ) {
         let shape = match action {
             Action::Modifier(_) => StickyKeyShape::PureMod,
@@ -502,7 +551,10 @@ impl Keyboard<'_> {
         // The action match is the narrow effect boundary. All variants store
         // and advance the same `StickyEntry` lifecycle.
         match action {
-            Action::Modifier(modifiers) => self.process_modifier_effect(modifiers, policy, event, event_time).await,
+            Action::Modifier(modifiers) => {
+                self.process_modifier_effect(modifiers, policy, event, event_time, modifier_source)
+                    .await
+            }
             Action::LayerOn(layer) => self.process_layer_effect(layer, policy, event, event_time).await,
             Action::KeyWithModifier(key, modifiers) => {
                 self.process_tap_key_effect(key, modifiers, policy, event, event_time)
@@ -518,6 +570,7 @@ impl Keyboard<'_> {
         policy: StickyKeyPolicy,
         event: KeyboardEvent,
         event_time: Instant,
+        producer_source: ModifierProducerSource,
     ) {
         if event.pressed {
             if let Some(index) = self.sticky_key_state.tap_key_index() {
@@ -527,27 +580,29 @@ impl Keyboard<'_> {
             if modifier_index.is_some_and(|index| {
                 self.sticky_key_state.active[index].is_some_and(|entry| entry.is_double_tap(event.pos, policy))
             }) {
-                self.sticky_key_state
-                    .remember_canceled_modifier_release(ModifierProducer {
-                        source: event.pos,
-                        modifiers,
-                    });
                 self.release_sticky_entry(modifier_index.expect("modifier checked above"))
                     .await;
                 return;
             }
 
             if let Some(index) = modifier_index {
+                let insertion = self.sticky_key_state.active[index]
+                    .as_mut()
+                    .expect("modifier index must contain an entry")
+                    .add_modifier_producer(modifiers, producer_source);
+                if insertion == ModifierProducerInsert::Full {
+                    return;
+                }
                 let entry = self.sticky_key_state.active[index]
                     .as_mut()
                     .expect("modifier index must contain an entry");
-                entry.add_modifier_producer(modifiers, event.pos);
                 entry.begin_modifier_press(event.pos, policy, event_time);
             } else if self
                 .sticky_key_state
-                .insert(StickyEntry::new(
-                    Action::Modifier(modifiers),
+                .insert(StickyEntry::new_modifier(
+                    modifiers,
                     event.pos,
+                    producer_source,
                     policy,
                     event_time,
                 ))
@@ -557,48 +612,66 @@ impl Keyboard<'_> {
                 return;
             }
             if policy.activate_on_keypress {
-                self.sticky_key_state.mark_modifier_host_visible();
                 self.send_keyboard_report_with_resolved_modifiers(true).await;
             }
         } else {
-            if self
-                .sticky_key_state
-                .consume_exact_canceled_modifier_release(modifiers, event.pos)
-            {
-                return;
-            }
             if let Some(index) = self.sticky_key_state.modifier_index() {
-                let release = {
+                let transition = {
                     let entry = self.sticky_key_state.active[index]
                         .as_mut()
                         .expect("modifier index must contain an entry");
-                    let exact_release = entry.on_exact_modifier_release(modifiers, event.pos);
-                    exact_release
-                        .map(|last| last && entry.on_physical_release(None, event_time) == PhysicalRelease::Released)
+                    entry.on_exact_modifier_release(modifiers, producer_source)
                 };
-                if let Some(release) = release {
-                    if release {
-                        self.release_sticky_entry(index).await;
+                self.finish_modifier_producer_release(index, transition, event_time)
+                    .await;
+            }
+        }
+    }
+
+    async fn finish_modifier_producer_release(
+        &mut self,
+        index: usize,
+        transition: ModifierProducerRelease,
+        event_time: Instant,
+    ) -> bool {
+        let ModifierProducerRelease::Released {
+            removed,
+            old_effective,
+            new_effective,
+            producers_remain,
+        } = transition
+        else {
+            return false;
+        };
+
+        let mut final_effective = new_effective;
+        let mut release_entry = false;
+        if !producers_remain {
+            if self.physical_keys_down > 0 {
+                release_entry = true;
+            } else {
+                let entry = self.sticky_key_state.active[index]
+                    .as_mut()
+                    .expect("modifier index must contain an entry");
+                match entry.on_physical_release(None, event_time) {
+                    PhysicalRelease::Latched => {
+                        entry.retain_modifier(removed.modifiers);
+                        final_effective = entry.modifiers();
                     }
-                    return;
-                }
-            }
-            if self.sticky_key_state.consume_canceled_combo_release(modifiers) {
-                return;
-            }
-            if let Some(index) = self.sticky_key_state.modifier_index() {
-                let release = {
-                    let entry = self.sticky_key_state.active[index]
-                        .as_mut()
-                        .expect("modifier index must contain an entry");
-                    entry.on_combo_modifier_release(modifiers).is_some_and(|last| last)
-                        && entry.on_physical_release(None, event_time) == PhysicalRelease::Released
-                };
-                if release {
-                    self.release_sticky_entry(index).await;
+                    PhysicalRelease::Released => release_entry = true,
+                    PhysicalRelease::Ignored => {}
                 }
             }
         }
+
+        if release_entry {
+            self.remove_sticky_modifier_entry(index);
+            final_effective = ModifierCombination::new();
+        }
+        let current_non_sticky = self.resolve_modifier_breakdown(false).non_sticky;
+        self.send_sticky_modifier_live_release(old_effective, final_effective, current_non_sticky)
+            .await;
+        true
     }
 
     async fn process_layer_effect(
@@ -789,7 +862,6 @@ impl Keyboard<'_> {
                         .expect("active entry checked above");
                     match entry.action {
                         Action::Modifier(_) => {
-                            update.modifier_was_host_visible = entry.modifier_effect().host_visible;
                             update.modifier_consumed = true;
                         }
                         Action::LayerOn(layer) => {
@@ -808,14 +880,12 @@ impl Keyboard<'_> {
     /// The result tells the caller whether a balancing keyboard report is
     /// needed; modifier/layer/tap-key details remain inside this module.
     pub(crate) fn finish_sticky_key_for_key(&mut self, event: KeyboardEvent, is_basic_keyboard_key: bool) -> bool {
-        if is_basic_keyboard_key {
-            self.sticky_key_state.mark_modifier_host_visible();
-        }
+        let modifier_was_host_visible = self.last_modifier_report.sticky_contributed.into_bits() != 0;
         let modifier_releases_on_press = self.sticky_key_state.modifier_releases_on_press();
         let update = self.update_sticky_key(event);
 
         (is_basic_keyboard_key && event.pressed && modifier_releases_on_press && update.modifier_consumed)
-            || (!is_basic_keyboard_key && update.modifier_consumed && update.modifier_was_host_visible)
+            || (!is_basic_keyboard_key && update.modifier_consumed && modifier_was_host_visible)
     }
 
     pub(crate) async fn release_sticky_key_on_layer_event(&mut self, event: StickyKeyReleaseMode) {
@@ -844,14 +914,13 @@ impl Keyboard<'_> {
             return;
         };
         match entry.action {
-            Action::Modifier(_) => {
-                let StickyEffectState::Modifier(modifier) = entry.effect_state else {
+            Action::Modifier(modifiers) => {
+                let StickyEffectState::Modifier(_) = entry.effect_state else {
                     unreachable!("modifier action must own modifier effect state");
                 };
-                for producer in modifier.producers.into_iter().flatten() {
-                    self.sticky_key_state.remember_canceled_modifier_release(producer);
-                }
-                if modifier.host_visible {
+                let current_non_sticky = self.resolve_modifier_breakdown(false).non_sticky;
+                let removed_from_host = modifiers & self.last_modifier_report.sticky_contributed & !current_non_sticky;
+                if removed_from_host.into_bits() != 0 {
                     self.send_keyboard_report_with_resolved_modifiers(false).await;
                 }
             }
@@ -875,6 +944,15 @@ impl Keyboard<'_> {
             _ => unreachable!("unsupported action cannot enter Sticky Key state"),
         }
     }
+
+    fn remove_sticky_modifier_entry(&mut self, index: usize) {
+        let Some(entry) = self.sticky_key_state.active[index].take() else {
+            return;
+        };
+        let StickyEffectState::Modifier(_) = entry.effect_state else {
+            unreachable!("modifier index must contain a modifier entry");
+        };
+    }
 }
 
 #[cfg(test)]
@@ -883,6 +961,10 @@ mod tests {
 
     fn pos(col: u8) -> KeyboardEventPos {
         KeyboardEventPos::key_pos(col, 0)
+    }
+
+    fn direct(col: u8) -> ModifierProducerSource {
+        ModifierProducerSource::Direct(pos(col))
     }
 
     fn policy(release_mode: StickyKeyReleaseMode) -> StickyKeyPolicy {
@@ -913,27 +995,38 @@ mod tests {
             policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE),
             pressed_at,
         );
-        latch.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+        latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
         latch.begin_modifier_press(pos(1), policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE), pressed_at);
 
         assert_eq!(
-            latch.on_exact_modifier_release(ModifierCombination::LCTRL, pos(0)),
-            Some(false)
+            latch.on_exact_modifier_release(ModifierCombination::LCTRL, direct(0)),
+            ModifierProducerRelease::Released {
+                removed: ModifierProducer {
+                    source: direct(0),
+                    modifiers: ModifierCombination::LCTRL,
+                },
+                old_effective: ModifierCombination::LCTRL | ModifierCombination::LSHIFT,
+                new_effective: ModifierCombination::LSHIFT,
+                producers_remain: true,
+            }
         );
         assert_eq!(latch.phase, StickyPhase::PressDeadlineInactive);
-        assert_eq!(
-            latch.on_exact_modifier_release(ModifierCombination::LSHIFT, pos(1)),
-            Some(true)
-        );
+        let final_release = latch.on_exact_modifier_release(ModifierCombination::LSHIFT, direct(1));
+        assert!(matches!(
+            final_release,
+            ModifierProducerRelease::Released {
+                new_effective,
+                producers_remain: false,
+                ..
+            } if new_effective == ModifierCombination::new()
+        ));
         assert_eq!(
             latch.on_physical_release(None, Instant::now()),
             PhysicalRelease::Latched
         );
+        latch.retain_modifier(ModifierCombination::LSHIFT);
         assert_eq!(latch.phase, StickyPhase::Latched);
-        assert_eq!(
-            latch.modifiers(),
-            ModifierCombination::LCTRL | ModifierCombination::LSHIFT
-        );
+        assert_eq!(latch.modifiers(), ModifierCombination::LSHIFT);
     }
 
     #[test]
@@ -945,18 +1038,24 @@ mod tests {
             policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE),
             pressed_at,
         );
-        latch.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+        latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
         latch.begin_modifier_press(pos(1), policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE), pressed_at);
         latch.mark_foreign_key();
 
-        assert_eq!(
-            latch.on_exact_modifier_release(ModifierCombination::LCTRL, pos(0)),
-            Some(false)
-        );
-        assert_eq!(
-            latch.on_exact_modifier_release(ModifierCombination::LSHIFT, pos(1)),
-            Some(true)
-        );
+        assert!(matches!(
+            latch.on_exact_modifier_release(ModifierCombination::LCTRL, direct(0)),
+            ModifierProducerRelease::Released {
+                producers_remain: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            latch.on_exact_modifier_release(ModifierCombination::LSHIFT, direct(1)),
+            ModifierProducerRelease::Released {
+                producers_remain: false,
+                ..
+            }
+        ));
         assert_eq!(
             latch.on_physical_release(None, Instant::now()),
             PhysicalRelease::Released
@@ -1061,30 +1160,42 @@ mod tests {
         let second_press = first_press + Duration::from_millis(250);
         let release_time = first_press + Duration::from_millis(400);
         let mut latch = modifier_entry(ModifierCombination::LCTRL, pos(0), hold_policy, first_press);
-        latch.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+        latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
         latch.begin_modifier_press(pos(1), hold_policy, second_press);
 
-        assert_eq!(
-            latch.on_exact_modifier_release(ModifierCombination::LSHIFT, pos(1)),
-            Some(false)
-        );
-        assert_eq!(
-            latch.on_exact_modifier_release(ModifierCombination::LCTRL, pos(0)),
-            Some(true)
-        );
+        assert!(matches!(
+            latch.on_exact_modifier_release(ModifierCombination::LSHIFT, direct(1)),
+            ModifierProducerRelease::Released {
+                producers_remain: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            latch.on_exact_modifier_release(ModifierCombination::LCTRL, direct(0)),
+            ModifierProducerRelease::Released {
+                producers_remain: false,
+                ..
+            }
+        ));
         assert_eq!(latch.on_physical_release(None, release_time), PhysicalRelease::Released);
 
         let mut reverse_release = modifier_entry(ModifierCombination::LCTRL, pos(0), hold_policy, first_press);
-        reverse_release.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+        reverse_release.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
         reverse_release.begin_modifier_press(pos(1), hold_policy, second_press);
-        assert_eq!(
-            reverse_release.on_exact_modifier_release(ModifierCombination::LCTRL, pos(0)),
-            Some(false)
-        );
-        assert_eq!(
-            reverse_release.on_exact_modifier_release(ModifierCombination::LSHIFT, pos(1)),
-            Some(true)
-        );
+        assert!(matches!(
+            reverse_release.on_exact_modifier_release(ModifierCombination::LCTRL, direct(0)),
+            ModifierProducerRelease::Released {
+                producers_remain: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            reverse_release.on_exact_modifier_release(ModifierCombination::LSHIFT, direct(1)),
+            ModifierProducerRelease::Released {
+                producers_remain: false,
+                ..
+            }
+        ));
         assert_eq!(
             reverse_release.on_physical_release(None, release_time),
             PhysicalRelease::Released
@@ -1099,7 +1210,7 @@ mod tests {
         latest_policy.release_after_hold = StickyKeyHoldDuration::from_duration(Duration::from_millis(500));
         let first_press = Instant::now();
         let mut latch = modifier_entry(ModifierCombination::LCTRL, pos(0), first_policy, first_press);
-        latch.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+        latch.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
         latch.begin_modifier_press(pos(1), latest_policy, first_press + Duration::from_millis(250));
 
         assert_eq!(
@@ -1112,7 +1223,7 @@ mod tests {
             timeout_first.deadline_disposition(first_press + Duration::from_millis(300)),
             DeadlineDisposition::Deferred
         );
-        timeout_first.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+        timeout_first.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
         timeout_first.begin_modifier_press(pos(1), latest_policy, first_press + Duration::from_millis(400));
         assert_eq!(
             timeout_first.on_physical_release(None, first_press + Duration::from_millis(450)),
@@ -1137,7 +1248,7 @@ mod tests {
                     DeadlineDisposition::Pending
                 );
             }
-            disabled_then_enabled.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+            disabled_then_enabled.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
             disabled_then_enabled.begin_modifier_press(
                 pos(1),
                 enabled_policy,
@@ -1156,7 +1267,7 @@ mod tests {
                     DeadlineDisposition::Deferred
                 );
             }
-            enabled_then_disabled.add_modifier_producer(ModifierCombination::LSHIFT, pos(1));
+            enabled_then_disabled.add_modifier_producer(ModifierCombination::LSHIFT, direct(1));
             enabled_then_disabled.begin_modifier_press(
                 pos(1),
                 disabled_policy,
@@ -1235,36 +1346,199 @@ mod tests {
     }
 
     #[test]
-    fn canceled_release_does_not_consume_a_new_modifier_latch() {
-        let mut state = StickyKeyState::default();
-        state.remember_canceled_modifier_release(ModifierProducer {
-            source: pos(0),
-            modifiers: ModifierCombination::LSHIFT,
-        });
-        state
-            .insert(modifier_entry(
-                ModifierCombination::LCTRL,
-                pos(1),
-                policy(StickyKeyReleaseMode::OTHER_KEY_RELEASE),
-                Instant::now(),
-            ))
-            .unwrap();
+    fn stale_direct_and_combo_releases_cannot_remove_a_current_same_mask_producer() {
+        let modifiers = ModifierCombination::LSHIFT;
+        let mut direct_effect = StickyModifierEffect::new(modifiers, direct(1));
 
-        assert!(state.consume_exact_canceled_modifier_release(ModifierCombination::LSHIFT, pos(0)));
-        assert!(state.modifier_index().is_some());
-        assert!(!state.consume_exact_canceled_modifier_release(ModifierCombination::LCTRL, pos(1)));
+        assert_eq!(
+            direct_effect.on_exact_release(modifiers, ModifierProducerSource::Combo(0)),
+            ModifierProducerRelease::Unmatched
+        );
+        assert_eq!(direct_effect.effective(), modifiers);
+
+        let mut combo_effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(1));
+        assert_eq!(
+            combo_effect.on_exact_release(modifiers, direct(0)),
+            ModifierProducerRelease::Unmatched
+        );
+        assert_eq!(
+            combo_effect.on_exact_release(modifiers, ModifierProducerSource::Combo(0)),
+            ModifierProducerRelease::Unmatched
+        );
+        assert_eq!(combo_effect.effective(), modifiers);
     }
 
     #[test]
-    fn new_exact_release_wins_over_same_modifier_combo_fallback() {
-        let mut state = StickyKeyState::default();
-        state.remember_canceled_modifier_release(ModifierProducer {
-            source: pos(0),
-            modifiers: ModifierCombination::LSHIFT,
-        });
-        let mut effect = StickyModifierEffect::new(ModifierCombination::LSHIFT, pos(1));
+    fn same_mask_combo_siblings_release_only_their_own_slot() {
+        let modifiers = ModifierCombination::LSHIFT;
+        let mut effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(0));
+        assert_eq!(
+            effect.begin_press(modifiers, ModifierProducerSource::Combo(3)),
+            ModifierProducerInsert::Added
+        );
 
-        assert_eq!(effect.on_exact_release(ModifierCombination::LSHIFT, pos(1)), Some(true));
-        assert!(state.consume_exact_canceled_modifier_release(ModifierCombination::LSHIFT, pos(0)));
+        assert!(matches!(
+            effect.on_exact_release(modifiers, ModifierProducerSource::Combo(0)),
+            ModifierProducerRelease::Released {
+                removed: ModifierProducer {
+                    source: ModifierProducerSource::Combo(0),
+                    modifiers: removed_modifiers,
+                },
+                producers_remain: true,
+                ..
+            } if removed_modifiers == modifiers
+        ));
+        assert!(matches!(
+            effect.on_exact_release(modifiers, ModifierProducerSource::Combo(3)),
+            ModifierProducerRelease::Released {
+                removed: ModifierProducer {
+                    source: ModifierProducerSource::Combo(3),
+                    modifiers: removed_modifiers,
+                },
+                producers_remain: false,
+                ..
+            } if removed_modifiers == modifiers
+        ));
+    }
+
+    #[test]
+    fn eight_combo_slots_report_the_exact_removed_owner() {
+        let modifiers = ModifierCombination::LCTRL;
+        let mut effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(0));
+        for index in 1..MAX_STICKY_MODIFIER_PRODUCERS {
+            assert_eq!(
+                effect.begin_press(modifiers, ModifierProducerSource::Combo(index as u16)),
+                ModifierProducerInsert::Added
+            );
+        }
+
+        for index in [4, 0, 7, 2, 5, 1, 6, 3] {
+            assert!(matches!(
+                effect.on_exact_release(modifiers, ModifierProducerSource::Combo(index)),
+                ModifierProducerRelease::Released {
+                    removed: ModifierProducer {
+                        source: ModifierProducerSource::Combo(removed_index),
+                        modifiers: removed_modifiers,
+                    },
+                    ..
+                } if removed_index == index && removed_modifiers == modifiers
+            ));
+        }
+    }
+
+    #[test]
+    fn modifier_producer_insertion_is_atomic_at_capacity() {
+        let mut effect = StickyModifierEffect::new(ModifierCombination::LCTRL, direct(0));
+        for index in 1..MAX_STICKY_MODIFIER_PRODUCERS {
+            assert_eq!(
+                effect.begin_press(ModifierCombination::LSHIFT, direct(index as u8)),
+                ModifierProducerInsert::Added
+            );
+        }
+        let producers = effect.producers;
+        let effective = effect.effective();
+
+        assert_eq!(
+            effect.begin_press(ModifierCombination::LALT, direct(9)),
+            ModifierProducerInsert::Full
+        );
+        assert_eq!(effect.producers, producers);
+        assert_eq!(effect.effective(), effective);
+    }
+
+    #[test]
+    fn rejected_releases_beyond_both_old_capacities_preserve_accepted_owners() {
+        let modifiers = ModifierCombination::LCTRL;
+        for combo_sources in [false, true] {
+            let source = |index: usize| {
+                if combo_sources {
+                    ModifierProducerSource::Combo(index as u16)
+                } else {
+                    direct(index as u8)
+                }
+            };
+            let mut effect = StickyModifierEffect::new(modifiers, source(0));
+            for index in 1..MAX_STICKY_MODIFIER_PRODUCERS {
+                assert_eq!(
+                    effect.begin_press(modifiers, source(index)),
+                    ModifierProducerInsert::Added
+                );
+            }
+            for index in MAX_STICKY_MODIFIER_PRODUCERS..(MAX_STICKY_MODIFIER_PRODUCERS * 3) {
+                assert_eq!(
+                    effect.begin_press(modifiers, source(index)),
+                    ModifierProducerInsert::Full
+                );
+            }
+
+            for index in (MAX_STICKY_MODIFIER_PRODUCERS..(MAX_STICKY_MODIFIER_PRODUCERS * 3)).rev() {
+                assert_eq!(
+                    effect.on_exact_release(modifiers, source(index)),
+                    ModifierProducerRelease::Unmatched
+                );
+            }
+            assert_eq!(effect.effective(), modifiers);
+            assert_eq!(effect.producers.iter().flatten().count(), MAX_STICKY_MODIFIER_PRODUCERS);
+        }
+    }
+
+    #[test]
+    fn direct_and_combo_identity_use_the_same_release_transition() {
+        let modifiers = ModifierCombination::LCTRL;
+        let mut direct_effect = StickyModifierEffect::new(modifiers, direct(0));
+        let mut combo_effect = StickyModifierEffect::new(modifiers, ModifierProducerSource::Combo(3));
+
+        for release in [
+            direct_effect.on_exact_release(modifiers, direct(0)),
+            combo_effect.on_exact_release(modifiers, ModifierProducerSource::Combo(3)),
+        ] {
+            assert!(matches!(
+                release,
+                ModifierProducerRelease::Released {
+                    old_effective,
+                    new_effective,
+                    producers_remain: false,
+                    ..
+                } if old_effective == modifiers && new_effective == ModifierCombination::new()
+            ));
+        }
+    }
+
+    #[test]
+    fn overlapping_modifier_producers_keep_shared_bits() {
+        let mut effect = StickyModifierEffect::new(ModifierCombination::LCTRL, direct(0));
+        effect.begin_press(ModifierCombination::LCTRL | ModifierCombination::LSHIFT, direct(1));
+
+        assert!(matches!(
+            effect.on_exact_release(ModifierCombination::LCTRL, direct(0)),
+            ModifierProducerRelease::Released {
+                old_effective,
+                new_effective,
+                producers_remain: true,
+                ..
+            } if old_effective == ModifierCombination::LCTRL | ModifierCombination::LSHIFT
+                && new_effective == ModifierCombination::LCTRL | ModifierCombination::LSHIFT
+        ));
+    }
+
+    #[test]
+    fn retained_modifiers_combine_with_live_producers() {
+        let mut effect = StickyModifierEffect::new(ModifierCombination::LSHIFT, direct(1));
+        effect.retain(ModifierCombination::LCTRL);
+
+        assert_eq!(
+            effect.effective(),
+            ModifierCombination::LCTRL | ModifierCombination::LSHIFT
+        );
+        assert!(matches!(
+            effect.on_exact_release(ModifierCombination::LSHIFT, direct(1)),
+            ModifierProducerRelease::Released {
+                old_effective,
+                new_effective,
+                producers_remain: false,
+                ..
+            } if old_effective == ModifierCombination::LCTRL | ModifierCombination::LSHIFT
+                && new_effective == ModifierCombination::LCTRL
+        ));
     }
 }
