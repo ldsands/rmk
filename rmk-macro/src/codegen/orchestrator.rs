@@ -268,7 +268,8 @@ mod tests {
     };
 
     use super::{
-        Behavior, Keymap, StickyKeyShapes, infer_sticky_key_shapes, validate_feature_config_parity,
+        Behavior, Keymap, StickyKeyShapes, expand_keyboard_init, infer_sticky_key_shapes,
+        validate_feature_config_parity,
     };
 
     /// Build the enabled-Cargo-features list that `validate_feature_config_parity` reads.
@@ -314,66 +315,141 @@ mod tests {
         infer_sticky_key_shapes(keymap, behavior, &features(&[]), false)
     }
 
+    fn modifier_shape() -> StickyKeyShapes {
+        StickyKeyShapes {
+            modifier: true,
+            ..Default::default()
+        }
+    }
+
+    fn layer_shape() -> StickyKeyShapes {
+        StickyKeyShapes {
+            layer: true,
+            ..Default::default()
+        }
+    }
+
+    fn tap_key_shape() -> StickyKeyShapes {
+        StickyKeyShapes {
+            tap_key: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn infers_shapes_from_every_key_action_container() {
-        let combo = Combo {
-            actions: vec!["SK(Tab, [])".to_string(), "A".to_string()],
-            output: "OSM(LShift)".to_string(),
+    fn matrix_and_encoder_endpoints_each_contribute() {
+        let mut matrix = keymap("A", None);
+        matrix.keymap = vec![vec![vec!["A".to_string(), "OSM(LShift)".to_string()]]];
+        assert_eq!(infer(&matrix, &behavior(vec![], vec![])), modifier_shape());
+
+        assert_eq!(
+            infer(
+                &keymap("A", Some(["OSL(1)", "A"])),
+                &behavior(vec![], vec![]),
+            ),
+            layer_shape()
+        );
+        assert_eq!(
+            infer(
+                &keymap("A", Some(["A", "SK(Tab, [])"])),
+                &behavior(vec![], vec![]),
+            ),
+            tap_key_shape()
+        );
+    }
+
+    #[test]
+    fn combo_input_and_output_each_contribute() {
+        let input = Combo {
+            actions: vec!["A".to_string(), "OSM(LShift)".to_string()],
+            output: "A".to_string(),
             layer: None,
         };
-        let fork = Fork {
-            trigger: "OSL(1)".to_string(),
-            negative_output: "SK(Tab, [LAlt])".to_string(),
-            positive_output: "OSM(LCtrl)".to_string(),
+        assert_eq!(
+            infer(&keymap("A", None), &behavior(vec![input], vec![])),
+            modifier_shape()
+        );
+
+        let output = Combo {
+            actions: vec!["A".to_string()],
+            output: "OSL(1)".to_string(),
+            layer: None,
+        };
+        assert_eq!(
+            infer(&keymap("A", None), &behavior(vec![output], vec![])),
+            layer_shape()
+        );
+    }
+
+    fn fork(trigger: &str, negative_output: &str, positive_output: &str) -> Fork {
+        Fork {
+            trigger: trigger.to_string(),
+            negative_output: negative_output.to_string(),
+            positive_output: positive_output.to_string(),
             match_any: Some("Shift".to_string()),
             match_none: None,
             kept_modifiers: None,
             bindable: false,
-        };
-        let all = infer(
-            &keymap("OSM(LGui)", Some(["OSL(1)", "SK(Tab, [])"])),
-            &behavior(vec![combo], vec![fork]),
-        );
-
-        assert_eq!(all, StickyKeyShapes::ALL);
+        }
     }
 
     #[test]
-    fn combo_and_fork_inputs_and_outputs_each_contribute() {
-        let cases = [
-            behavior(
-                vec![Combo {
-                    actions: vec!["OSM(LShift)".to_string()],
-                    output: "A".to_string(),
-                    layer: None,
-                }],
-                vec![],
-            ),
-            behavior(
-                vec![Combo {
-                    actions: vec!["A".to_string()],
-                    output: "OSL(1)".to_string(),
-                    layer: None,
-                }],
-                vec![],
-            ),
-            behavior(
-                vec![],
-                vec![Fork {
-                    trigger: "OSM(LShift)".to_string(),
-                    negative_output: "OSL(1)".to_string(),
-                    positive_output: "SK(Tab, [])".to_string(),
-                    match_any: Some("Shift".to_string()),
-                    match_none: None,
-                    kept_modifiers: None,
-                    bindable: false,
-                }],
-            ),
-        ];
+    fn fork_endpoints_each_contribute() {
+        for (fork, expected) in [
+            (fork("OSM(LShift)", "A", "A"), modifier_shape()),
+            (fork("A", "OSL(1)", "A"), layer_shape()),
+            (fork("A", "A", "SK(Tab, [])"), tap_key_shape()),
+        ] {
+            assert_eq!(
+                infer(&keymap("A", None), &behavior(vec![], vec![fork])),
+                expected
+            );
+        }
+    }
 
-        assert!(infer(&keymap("A", None), &cases[0]).modifier);
-        assert!(infer(&keymap("A", None), &cases[1]).layer);
-        assert_eq!(infer(&keymap("A", None), &cases[2]), StickyKeyShapes::ALL);
+    #[test]
+    fn empty_static_keymap_needs_no_sticky_handler() {
+        let mut empty = keymap("A", None);
+        empty.rows = 0;
+        empty.cols = 0;
+        empty.layers = 0;
+        empty.keymap.clear();
+        empty.key_info.clear();
+
+        assert_eq!(
+            infer(&empty, &behavior(vec![], vec![])),
+            StickyKeyShapes::default()
+        );
+    }
+
+    #[test]
+    fn generated_keyboard_init_preserves_every_shape_tuple() {
+        for modifier in [false, true] {
+            for layer in [false, true] {
+                for tap_key in [false, true] {
+                    let tokens = expand_keyboard_init(StickyKeyShapes {
+                        modifier,
+                        layer,
+                        tap_key,
+                    })
+                    .to_string()
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>();
+
+                    assert!(
+                        tokens.contains(&format!("constRMK_HAS_STICKY_MODIFIER:bool={modifier};"))
+                    );
+                    assert!(tokens.contains(&format!("constRMK_HAS_STICKY_LAYER:bool={layer};")));
+                    assert!(
+                        tokens.contains(&format!("constRMK_HAS_STICKY_TAP_KEY:bool={tap_key};"))
+                    );
+                    assert!(tokens.contains(
+                        "Keyboard::<RMK_HAS_STICKY_MODIFIER,RMK_HAS_STICKY_LAYER,RMK_HAS_STICKY_TAP_KEY,>::new"
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
@@ -400,6 +476,9 @@ mod tests {
 
     #[test]
     fn morse_action_only_outputs_do_not_enable_sticky_dispatch() {
+        use rmk_types::action::{Action, KeyAction};
+        use rmk_types::modifier::ModifierCombination;
+
         let mut behavior = behavior(vec![], vec![]);
         behavior.morse = Some(Morse {
             enable_flow_tap: false,
@@ -430,6 +509,10 @@ mod tests {
         assert_eq!(
             infer(&keymap("A", None), &behavior),
             StickyKeyShapes::default()
+        );
+        assert_eq!(
+            KeyAction::Sticky(Action::Modifier(ModifierCombination::LSHIFT), 0).to_action(),
+            Action::No
         );
     }
 
@@ -900,6 +983,14 @@ pub(crate) fn expand_matrix_and_keyboard_init(
             }
         }
     };
+    let keyboard = expand_keyboard_init(sticky_key_shapes);
+    quote! {
+        #keyboard
+        #matrix
+    }
+}
+
+fn expand_keyboard_init(sticky_key_shapes: StickyKeyShapes) -> TokenStream2 {
     let modifier = sticky_key_shapes.modifier;
     let layer = sticky_key_shapes.layer;
     let tap_key = sticky_key_shapes.tap_key;
@@ -912,7 +1003,6 @@ pub(crate) fn expand_matrix_and_keyboard_init(
             RMK_HAS_STICKY_LAYER,
             RMK_HAS_STICKY_TAP_KEY,
         >::new(&keymap);
-        #matrix
     }
 }
 
