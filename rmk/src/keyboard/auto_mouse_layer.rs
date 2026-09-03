@@ -137,7 +137,7 @@ impl<'a, 'k> AutoMouseLayerRunner<'a, 'k> {
         if !self.entries.iter().any(|e| e.self_activated) {
             return;
         }
-        for layer in keypress_step(&mut self.entries, event.action, Instant::now()) {
+        for layer in keypress_step_with_origin(&mut self.entries, event.action, event.is_sticky, Instant::now()) {
             self.keymap.deactivate_layer_if_active(layer);
         }
     }
@@ -283,8 +283,14 @@ fn pointing_step(entries: &mut [EntryState], idx: usize, now: Instant, activated
 ///
 /// Actions that emit no single keycode/modifier set (layer switches, macros,
 /// `Again`/`Repeat`, `GraveEscape`, ...) are unclassifiable and never deactivate;
-/// the timeout path clears the layer instead.
-fn keypress_step(entries: &mut [EntryState], action: Action, now: Instant) -> Vec<u8, AUTO_MOUSE_LAYER_MAX_NUM> {
+/// the timeout path clears the layer instead. Sticky actions are also
+/// unclassifiable regardless of their wrapped action.
+fn keypress_step_with_origin(
+    entries: &mut [EntryState],
+    action: Action,
+    is_sticky: bool,
+    now: Instant,
+) -> Vec<u8, AUTO_MOUSE_LAYER_MAX_NUM> {
     let mut released: Vec<u8, AUTO_MOUSE_LAYER_MAX_NUM> = Vec::new();
     for i in 0..entries.len() {
         if !entries[i].self_activated {
@@ -293,7 +299,8 @@ fn keypress_step(entries: &mut [EntryState], action: Action, now: Instant) -> Ve
         let cfg = &entries[i].config;
         // Classify: does this key press cause deactivation for this entry?
         // Only meaningful when `deactivate_on_key` is set.
-        let causes_deactivation = cfg.deactivate_on_key
+        let causes_deactivation = !is_sticky
+            && cfg.deactivate_on_key
             && match action {
                 // The repeated keycode is unknown here; treat as unclassifiable
                 // so a repeated mouse key is not misclassified as non-mouse.
@@ -340,6 +347,11 @@ fn keypress_step(entries: &mut [EntryState], action: Action, now: Instant) -> Ve
         }
     }
     released
+}
+
+#[cfg(test)]
+fn keypress_step(entries: &mut [EntryState], action: Action, now: Instant) -> Vec<u8, AUTO_MOUSE_LAYER_MAX_NUM> {
+    keypress_step_with_origin(entries, action, false, now)
 }
 
 /// Push `entry.deadline` forward to `now + timeout` if it would extend, not shorten, the current deadline.
@@ -994,6 +1006,41 @@ mod tests {
                 action
             );
         }
+    }
+
+    #[test]
+    fn sticky_action_does_not_deactivate_layer() {
+        let mut entries = [holding_entry_with_deactivate(3, &[])];
+
+        let released = keypress_step_with_origin(
+            &mut entries,
+            Action::Modifier(ModifierCombination::LCTRL),
+            true,
+            at(2000),
+        );
+
+        assert!(released.is_empty());
+        assert!(entries[0].self_activated);
+        assert_eq!(entries[0].deadline, Some(at(1000)));
+    }
+
+    #[test]
+    fn sticky_action_extends_deadline_when_configured() {
+        let mut entry = holding_entry_with_deactivate(3, &[]);
+        entry.config.reset_timeout_on_key = true;
+        entry.config.timeout = Duration::from_millis(500);
+        let mut entries = [entry];
+
+        let released = keypress_step_with_origin(
+            &mut entries,
+            Action::Modifier(ModifierCombination::LCTRL),
+            true,
+            at(2000),
+        );
+
+        assert!(released.is_empty());
+        assert!(entries[0].self_activated);
+        assert_eq!(entries[0].deadline, Some(at(2500)));
     }
 
     // ── modifier-only actions (e.g. MT hold) ─────────────────────────────

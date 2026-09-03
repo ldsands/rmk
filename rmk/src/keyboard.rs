@@ -996,11 +996,7 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
             }
             KeyAction::Tap(action) => self.process_key_action_tap(action, event).await,
             KeyAction::Sticky(action, profile) => {
-                publish_event_async(ActionEvent {
-                    action,
-                    keyboard_event: event,
-                })
-                .await;
+                publish_event_async(ActionEvent::new_sticky(action, event)).await;
                 let source = combo_index.map_or(StickyKeySource::Direct(event.pos), |index| {
                     StickyKeySource::Combo(index as u16)
                 });
@@ -1415,11 +1411,7 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
     }
 
     async fn process_key_action_normal(&mut self, action: Action, event: KeyboardEvent) {
-        publish_event_async(ActionEvent {
-            action,
-            keyboard_event: event,
-        })
-        .await;
+        publish_event_async(ActionEvent::new(action, event)).await;
 
         let release_sticky_after_action = self.prepare_sticky_key_for_action(action, event).await;
 
