@@ -439,10 +439,6 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
     {
         self.update_physical_key_count(event);
 
-        // Claim press-triggered Sticky effects at the physical event, before a
-        // combo or morse action can defer its eventual dispatch past timeout.
-        self.sticky_key_state.claim_buffered_press(event);
-
         // Check for mode transitions (e.g., entering/exiting passkey entry)
         #[cfg(feature = "passkey_entry")]
         self.passkey_entry_state.check_mode_transition();
@@ -466,6 +462,7 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
                     .await
             }
         } else {
+            self.sticky_key_state.claim_buffered_press(event);
             self.process_key_action(key_action, event, None, event_time).await
         }
     }
@@ -537,7 +534,7 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
                     event_time,
                     timeout_time,
                 );
-                let held_key = combo_index.map_or(held_key, |index| held_key.with_combo_index(index as u16));
+                let held_key = combo_index.map_or(held_key, |index| held_key.with_sticky_combo_index(index as u16));
                 self.held_buffer.push(held_key);
             }
             KeyBehaviorDecision::Ignore => {
@@ -682,15 +679,15 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
                     // Releasing the current key, will always be tapping, because timeout isn't here
                     let mut resolved = false;
                     if let Some(mut held_key) = self.held_buffer.remove_if(|k| k.event.pos == pos) {
-                        // A buffered combo output must keep its stable action
-                        // and producer identity. Physical keys still follow
-                        // layer changes while held.
-                        let key_action = if held_key.combo_index.is_some() {
+                        // A buffered Sticky combo output must keep its stable
+                        // action and producer identity. Every other buffered
+                        // key still follows layer changes while held.
+                        let key_action = if held_key.sticky_combo_index.is_some() {
                             held_key.action
                         } else {
                             self.keymap.get_action_with_layer_cache(held_key.event)
                         };
-                        if held_key.combo_index.is_none() && key_action != held_key.action {
+                        if held_key.sticky_combo_index.is_none() && key_action != held_key.action {
                             keyboard_state_updated = true;
                         }
                         debug!("Processing current key before releasing: {:?}", held_key.event);
@@ -704,7 +701,7 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
                                 }
                                 KeyAction::Sticky(action, profile) => {
                                     let source = held_key
-                                        .combo_index
+                                        .sticky_combo_index
                                         .map_or(StickyKeySource::Direct(held_key.event.pos), StickyKeySource::Combo);
                                     self.process_action_sticky_key(
                                         action,
@@ -771,7 +768,7 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
 
                     if trigger_normal && let Some(held_key) = self.held_buffer.remove_if(|k| k.event.pos == pos) {
                         debug!("Cleaning buffered normal key");
-                        let action = if keyboard_state_updated && held_key.combo_index.is_none() {
+                        let action = if keyboard_state_updated && held_key.sticky_combo_index.is_none() {
                             self.keymap.get_action_with_layer_cache(held_key.event)
                         } else {
                             held_key.action
@@ -783,7 +780,7 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
                         self.process_key_action_inner(
                             &action,
                             held_key.event,
-                            held_key.combo_index.map(usize::from),
+                            held_key.sticky_combo_index.map(usize::from),
                             held_key.press_time,
                         )
                         .await;
@@ -1266,6 +1263,11 @@ impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP
                 return (None, None);
             }
         }
+
+        // Claim press-triggered Sticky effects only after combo classification.
+        // A swallowed re-press has no eventual action dispatch to finish a claim.
+        self.sticky_key_state.claim_buffered_press(event);
+
         // Combo idle cooldown: skip combo recording if within idle window
         // Equivalent to ZMK's require-prior-idle-ms. Key still dispatches normally.
         let skip_combo = event.pressed
@@ -2418,7 +2420,7 @@ mod test {
                     Instant::now(),
                     Instant::now(),
                 )
-                .with_combo_index(3),
+                .with_sticky_combo_index(3),
             );
             keyboard.fire_held_non_morse_keys().await;
             assert!(keyboard.keymap.is_layer_active(1));
@@ -2449,7 +2451,7 @@ mod test {
                     Instant::now(),
                     Instant::now(),
                 )
-                .with_combo_index(4),
+                .with_sticky_combo_index(4),
             );
             keyboard.fire_held_non_morse_keys().await;
             assert!(keyboard.held_keycodes.contains(&HidKeyCode::Tab));

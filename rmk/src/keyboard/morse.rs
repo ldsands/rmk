@@ -9,7 +9,7 @@ use crate::keyboard::sticky_key::StickyKeyDispatch;
 use crate::keymap::KeyMap;
 
 // 'morse' is an alias for the superset of tap dance and tap hold keys, since their handling have many similarities
-// Morse can flush buffered combo actions back through the canonical Sticky
+// Morse can flush buffered Sticky combo actions back through the canonical Sticky
 // dispatcher, so all of its private helpers share the same internal bound.
 #[allow(private_bounds)]
 impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>
@@ -271,7 +271,7 @@ where
         // Trigger all non morse keys in the buffer
         while let Some(key) = self.held_buffer.remove_if(|k| !k.action.is_morse()) {
             debug!("Trigger non-morse key: {:?}", key);
-            if let Some(combo_index) = key.combo_index {
+            if let Some(combo_index) = key.sticky_combo_index {
                 self.prepare_key_action_dispatch(key.event);
                 self.process_non_morse_key_action_inner(
                     key.action,

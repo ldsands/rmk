@@ -1,13 +1,16 @@
 [layout]
 rows = 1
-cols = 2
-map = "(0,0) (0,1)"
+cols = 5
+map = "(0,0) (0,1) (0,2) (0,3) (0,4)"
 
 [keymap]
-layers = 1
+layers = 2
 
 [[keymap.layer]]
-keys = "SK(LShift) A"
+keys = "SK(LShift) A SK(MO(1)) C D"
+
+[[keymap.layer]]
+keys = "SK(LShift) B SK(MO(1)) C E"
 
 [behavior.sticky_key]
 activate_on_keypress = true
@@ -40,3 +43,23 @@ steps = [
   { release = [0, 1] },
 ]
 expect = [["LShift", "A"], ["A"], []]
+
+# Re-pressing one constituent of a held, already-triggered combo is swallowed.
+# It must not claim the Sticky layer because no action will later finish that
+# claim. The layer should therefore keep its finite deadline and expire.
+[[test]]
+name = "reasserted_combo_press_does_not_suspend_sticky_timeout"
+behavior.sticky_key = { activate_on_keypress = false, timeout = "50ms", release_mode = "other_key_press" }
+behavior.combo = { timeout = "100ms", combos = [{ actions = ["B", "C"], output = "No" }] }
+steps = [
+  { tap = { pos = [0, 2], duration = 10 } },
+  { press = [0, 1] },
+  { press = [0, 3] },
+  { release = [0, 1] },
+  { press = [0, 1] },
+  { delay = 100 },
+  { tap = { pos = [0, 4], duration = 10 } },
+  { release = [0, 3] },
+  { release = [0, 1] },
+]
+expect = [["D"], []]
