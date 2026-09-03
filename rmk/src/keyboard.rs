@@ -300,10 +300,21 @@ pub struct Keyboard<
     passkey_entry_state: crate::ble::passkey::PasskeyEntryState,
 }
 
+impl<'a> Keyboard<'a> {
+    pub fn new(keymap: &'a KeyMap<'a>) -> Self {
+        Self::new_with_sticky_shapes(keymap)
+    }
+}
+
 impl<'a, const STICKY_MODIFIER: bool, const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>
     Keyboard<'a, STICKY_MODIFIER, STICKY_LAYER, STICKY_TAP_KEY>
 {
-    pub fn new(keymap: &'a KeyMap<'a>) -> Self {
+    /// Construct a keyboard with the Sticky handlers selected by the type.
+    ///
+    /// Macro-generated entry points use this constructor. Pure-Rust callers
+    /// should use [`Keyboard::new`], which retains every Sticky handler.
+    #[doc(hidden)]
+    pub fn new_with_sticky_shapes(keymap: &'a KeyMap<'a>) -> Self {
         Keyboard {
             keymap,
             keyboard_event_subscriber: KeyboardEvent::subscriber(),

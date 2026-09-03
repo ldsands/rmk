@@ -562,6 +562,10 @@ impl ModifierStickyDispatch<true> for () {
     }
 }
 
+// Keep the disabled implementations in the same explicit-future form as the
+// enabled implementations. This dispatch boundary is flash-sensitive and was
+// measured in this form when the unused handlers were eliminated.
+#[allow(clippy::manual_async_fn)]
 impl ModifierStickyDispatch<false> for () {
     fn dispatch_modifier<const STICKY_LAYER: bool, const STICKY_TAP_KEY: bool>(
         _keyboard: &mut Keyboard<'_, false, STICKY_LAYER, STICKY_TAP_KEY>,
@@ -600,6 +604,7 @@ impl LayerStickyDispatch<true> for () {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl LayerStickyDispatch<false> for () {
     fn dispatch_layer<const STICKY_MODIFIER: bool, const STICKY_TAP_KEY: bool>(
         _keyboard: &mut Keyboard<'_, STICKY_MODIFIER, false, STICKY_TAP_KEY>,
@@ -640,6 +645,7 @@ impl TapKeyStickyDispatch<true> for () {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl TapKeyStickyDispatch<false> for () {
     fn dispatch_tap_key<const STICKY_MODIFIER: bool, const STICKY_LAYER: bool>(
         _keyboard: &mut Keyboard<'_, STICKY_MODIFIER, STICKY_LAYER, false>,

@@ -445,7 +445,7 @@ mod tests {
                         tokens.contains(&format!("constRMK_HAS_STICKY_TAP_KEY:bool={tap_key};"))
                     );
                     assert!(tokens.contains(
-                        "Keyboard::<RMK_HAS_STICKY_MODIFIER,RMK_HAS_STICKY_LAYER,RMK_HAS_STICKY_TAP_KEY,>::new"
+                        "Keyboard::<RMK_HAS_STICKY_MODIFIER,RMK_HAS_STICKY_LAYER,RMK_HAS_STICKY_TAP_KEY,>::new_with_sticky_shapes"
                     ));
                 }
             }
@@ -600,6 +600,9 @@ mod tests {
     }
 }
 
+// These are independent generator inputs already owned by the caller. A
+// one-use context type would hide that data flow without reducing complexity.
+#[allow(clippy::too_many_arguments)]
 fn expand_main(
     host: &Host,
     hardware: &Hardware,
@@ -1002,7 +1005,7 @@ fn expand_keyboard_init(sticky_key_shapes: StickyKeyShapes) -> TokenStream2 {
             RMK_HAS_STICKY_MODIFIER,
             RMK_HAS_STICKY_LAYER,
             RMK_HAS_STICKY_TAP_KEY,
-        >::new(&keymap);
+        >::new_with_sticky_shapes(&keymap);
     }
 }
 
